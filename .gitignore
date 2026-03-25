@@ -1,0 +1,12 @@
+logs/
+test/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.idea/
+.vscode/
+*.bak
+
