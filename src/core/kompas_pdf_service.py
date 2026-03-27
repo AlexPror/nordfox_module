@@ -217,16 +217,31 @@ def _export_direct_dwg_with_saveas(input_path: str, output_path: str) -> tuple[b
             except Exception:
                 pass
 
-            ok = bool(doc7.SaveAs(output_path))
-            if ok and Path(output_path).exists() and Path(output_path).stat().st_size > 100:
+            output_obj = Path(output_path)
+
+            def _is_dwg_ok() -> bool:
+                return output_obj.exists() and output_obj.stat().st_size > 100
+
+            ok = bool(doc7.SaveAs(str(output_obj)))
+            if (ok or _is_dwg_ok()) and _is_dwg_ok():
                 return True, "SaveAs(DWG)"
 
             try:
-                ok3 = bool(doc7.SaveAs3(output_path, "", False, 0))
+                ok3 = bool(doc7.SaveAs3(str(output_obj), "", False, 0))
             except Exception:
                 ok3 = False
-            if ok3 and Path(output_path).exists() and Path(output_path).stat().st_size > 100:
-                return True, "SaveAs3(DWG)"
+            if (ok3 or _is_dwg_ok()) and _is_dwg_ok():
+                return True, "SaveAs3-empty(DWG)"
+
+            # На части версий КОМПАС формат требуется явно.
+            for fmt in ("dwg", "DWG"):
+                try:
+                    okf = bool(doc7.SaveAs3(str(output_obj), fmt, False, 0))
+                except Exception:
+                    okf = False
+                if (okf or _is_dwg_ok()) and _is_dwg_ok():
+                    return True, f"SaveAs3-{fmt}(DWG)"
+
             return False, "Direct DWG export failed (SaveAs/SaveAs3)"
         finally:
             try:

@@ -120,8 +120,17 @@ class DrawingDwgExporter:
                 result["exported_dwgs"] += 1
                 result["dwg_files"].append(str(output_dwg))
             else:
-                result["failed_drawings"] += 1
-                result["errors"].append(f"{drawing.name}: {one.get('error', 'Unknown error')}")
+                # Для некоторых связок COM/KOMPAS сервис может вернуть 500,
+                # хотя DWG уже создан на диске.
+                if output_dwg.exists() and output_dwg.stat().st_size > 100:
+                    result["exported_dwgs"] += 1
+                    result["dwg_files"].append(str(output_dwg))
+                    result["errors"].append(
+                        f"{drawing.name}: сервис вернул ошибку, но DWG создан ({one.get('error', 'Unknown error')})"
+                    )
+                else:
+                    result["failed_drawings"] += 1
+                    result["errors"].append(f"{drawing.name}: {one.get('error', 'Unknown error')}")
 
         result["success"] = result["exported_dwgs"] > 0
         return result
