@@ -15,6 +15,12 @@
 from __future__ import annotations
 
 import logging
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -37,10 +43,12 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QFormLayout,
     QComboBox,
+    QToolBox,
     QMessageBox,
     QTableWidget,
     QTableWidgetItem,
     QCheckBox,
+    QSpinBox,
 )
 from PyQt6.QtWidgets import QApplication, QProgressDialog
 
@@ -52,6 +60,12 @@ from ..core.log_store import JsonLogStore
 from ..core.models import KompasDocumentInfo, KompasVariable
 from ..core.stamp_updater import update_all_drawing_stamps
 from ..core.project_copy import copy_project_tree
+from ..core.profile_rules import (
+    build_element_designation,
+    build_element_name,
+    collect_assembly_numeric_values,
+    infer_role_from_part_name,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -99,14 +113,11 @@ class MainWindow(QMainWindow):
         self._var_inputs: Dict[str, QLineEdit] = {}
         # Поля для переменных чертежей (комментарии): имя переменной -> QLineEdit
         self._drawing_comment_inputs: Dict[str, QLineEdit] = {}
-        # Профиль и авто-обозначение/наименование по блокам: block_id -> {...}
-        self._block_profile_combos: Dict[str, QComboBox] = {}
-        self._block_designation_edits: Dict[str, QLineEdit] = {}
-        self._block_name_edits: Dict[str, QLineEdit] = {}
-        # Таблица уникальных деталей/сборок: key -> KompasDocumentInfo
-        self._assembly_items: Dict[tuple[str, str, str], KompasDocumentInfo] = {}
-        self._assembly_item_new_marking: Dict[tuple[str, str, str], QLineEdit] = {}
-        self._assembly_item_new_name: Dict[tuple[str, str, str], QLineEdit] = {}
+        # Таблица элементов: путь документа -> KompasDocumentInfo.
+        # Это исключает "схлопывание" разных файлов с одинаковыми mark/name.
+        self._assembly_items: Dict[Path, KompasDocumentInfo] = {}
+        self._assembly_item_new_marking: Dict[Path, QLineEdit] = {}
+        self._assembly_item_new_name: Dict[Path, QLineEdit] = {}
 
         self._kompas = KompasConnector()
         self._json_log: Optional[JsonLogStore] = None
@@ -150,12 +161,13 @@ class MainWindow(QMainWindow):
         # Строка режима "копия + обновление"
         copy_row = QHBoxLayout()
         self.copy_mode_check = QCheckBox("Работать с копией проекта")
-        self.copy_mode_check.setChecked(True)
+        self.copy_mode_check.setChecked(False)
+        self.copy_mode_check.setVisible(False)
         self.copy_target_edit = QLineEdit()
         self.copy_target_edit.setPlaceholderText("Папка назначения для копии проекта...")
         self.btn_copy_target_browse = QPushButton("Папка копии...")
         self.btn_copy_target_browse.clicked.connect(self._browse_copy_target_folder)
-        self.btn_copy_and_update = QPushButton("Копировать и обновить")
+        self.btn_copy_and_update = QPushButton("Создать проект")
         self.btn_copy_and_update.setEnabled(False)
         self.btn_copy_and_update.clicked.connect(self._on_copy_and_update_clicked)
         copy_row.addWidget(self.copy_mode_check)
@@ -163,6 +175,14 @@ class MainWindow(QMainWindow):
         copy_row.addWidget(self.btn_copy_target_browse)
         copy_row.addWidget(self.btn_copy_and_update)
         top_layout.addLayout(copy_row)
+
+        hint_copy = QLabel(
+            "Кнопка «Создать проект» делает копию в указанной папке. "
+            "Кнопки «Обновить переменные» и «Пересканировать» работают только с текущей «Папкой проекта»."
+        )
+        hint_copy.setWordWrap(True)
+        hint_copy.setStyleSheet("color: palette(mid); font-size: 11px;")
+        top_layout.addWidget(hint_copy)
 
         # Строка обозначение / наименование сборки
         assembly_row = QHBoxLayout()
@@ -179,19 +199,6 @@ class MainWindow(QMainWindow):
         assembly_row.addWidget(self.assembly_name_edit)
 
         top_layout.addLayout(assembly_row)
-
-        # Строка выбора типа профиля
-        profile_row = QHBoxLayout()
-        lbl_profile = QLabel("Тип профиля:")
-        self.profile_combo = QComboBox()
-        self.profile_combo.setEditable(False)
-        self.profile_combo.setMinimumWidth(260)
-        self._fill_profiles()
-
-        profile_row.addWidget(lbl_profile)
-        profile_row.addWidget(self.profile_combo, stretch=1)
-
-        top_layout.addLayout(profile_row)
 
         main_layout.addWidget(top_group)
 
@@ -214,6 +221,8 @@ class MainWindow(QMainWindow):
         self.vars_blocks_layout = QVBoxLayout(self.vars_blocks_container)
         self.vars_blocks_layout.setContentsMargins(0, 0, 0, 0)
         self.vars_blocks_layout.setSpacing(8)
+        self.vars_toolbox = QToolBox()
+        self.vars_blocks_layout.addWidget(self.vars_toolbox)
         self.vars_scroll.setWidget(self.vars_blocks_container)
 
         vars_layout.addWidget(self.vars_scroll)
@@ -237,6 +246,40 @@ class MainWindow(QMainWindow):
         # Вкладка "Детали/подсборки" (таблица обозначений/наименований)
         self.items_tab = QWidget()
         items_layout = QVBoxLayout(self.items_tab)
+
+        items_toolbar = QHBoxLayout()
+        items_toolbar.addWidget(QLabel("Серия (1–4):"))
+        self.items_series_combo = QComboBox()
+        for i in range(1, 5):
+            self.items_series_combo.addItem(str(i))
+        items_toolbar.addWidget(self.items_series_combo)
+        items_toolbar.addWidget(QLabel("Профиль для обозначения:"))
+        self.items_profile_combo = QComboBox()
+        self.items_profile_combo.setMinimumWidth(220)
+        self._fill_profile_combo(self.items_profile_combo)
+        items_toolbar.addWidget(self.items_profile_combo, stretch=1)
+        self.btn_apply_designation_rules = QPushButton("Заполнить «новое обозначение» по правилам")
+        self.btn_apply_designation_rules.setToolTip(
+            "По переменным сборки (длины СК/СС/Р) и выбранному профилю "
+            "заполняет колонку «Новое обозначение» для деталей, где роль угадывается по наименованию."
+        )
+        self.btn_apply_designation_rules.clicked.connect(self._on_apply_designation_rules)
+        items_toolbar.addWidget(self.btn_apply_designation_rules)
+        self.btn_apply_items_meta = QPushButton("Применить новые обозн./наимен.")
+        self.btn_apply_items_meta.setToolTip(
+            "Записывает непустые значения из колонок «Новое обозначение» / "
+            "«Новое наименование» в свойства деталей/сборки."
+        )
+        self.btn_apply_items_meta.clicked.connect(self._on_apply_items_meta_clicked)
+        items_toolbar.addWidget(self.btn_apply_items_meta)
+        self.btn_sync_assembly_components = QPushButton("Синхр. вхождения в сборке")
+        # SAFE MODE: временно отключено из-за нестабильного COM-crash в окружении пользователя.
+        self.btn_sync_assembly_components.setEnabled(False)
+        self.btn_sync_assembly_components.setToolTip(
+            "Временно отключено: синхронизация вхождений сборки может аварийно завершать КОМПАС."
+        )
+        items_toolbar.addWidget(self.btn_sync_assembly_components)
+        items_layout.addLayout(items_toolbar)
 
         self.items_table = QTableWidget(0, 6, self.items_tab)
         self.items_table.setHorizontalHeaderLabels(
@@ -265,24 +308,40 @@ class MainWindow(QMainWindow):
         stamp_form = QFormLayout()
         stamp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self.stamp_developer_edit = QLineEdit()
-        self.stamp_checker_edit = QLineEdit()
+        self.stamp_designation_edit = QLineEdit()
+        self.stamp_name_edit = QLineEdit()
+        self.stamp_designation_edit.setPlaceholderText("Обозначение (ячейка 2, см. stamp_cells.py)")
+        self.stamp_name_edit.setPlaceholderText("Наименование (ячейка 1)")
+
+        self.stamp_sheet_auto_check = QCheckBox("Нумеровать листы автоматически (1…N, порядок — см. справку)")
+        self.stamp_sheet_auto_check.setChecked(False)
+        sheet_row = QHBoxLayout()
+        sheet_row.addWidget(QLabel("Лист (вручную):"))
+        self.stamp_sheet_current_spin = QSpinBox()
+        self.stamp_sheet_current_spin.setRange(0, 9999)
+        self.stamp_sheet_current_spin.setSpecialValueText("—")
+        self.stamp_sheet_current_spin.setValue(0)
+        self.stamp_sheet_total_spin = QSpinBox()
+        self.stamp_sheet_total_spin.setRange(0, 9999)
+        self.stamp_sheet_total_spin.setSpecialValueText("—")
+        self.stamp_sheet_total_spin.setValue(0)
+        sheet_row.addWidget(self.stamp_sheet_current_spin)
+        sheet_row.addWidget(QLabel("из"))
+        sheet_row.addWidget(self.stamp_sheet_total_spin)
+        sheet_row.addStretch(1)
+
+        self.stamp_developer_edit = self._make_person_combo(["Воробьев", "Заметалин", "Сизонов"])
+        self.stamp_checker_edit = self._make_person_combo(["Заметалин", "Воробьев", "Сизонов"])
         self.stamp_org_edit = QLineEdit()
-        # Материал теперь задается через выпадающий список толщины и типа материала.
+        # Материал задаётся через выпадающие списки или строку-заглушку.
         self.stamp_material_thickness_combo = QComboBox()
         self.stamp_material_type_combo = QComboBox()
         self.stamp_material_edit = QLineEdit()
         self.stamp_material_edit.setReadOnly(False)
-        self.stamp_tech_ctrl_edit = QLineEdit()
-        self.stamp_norm_ctrl_edit = QLineEdit()
-        self.stamp_approved_edit = QLineEdit()
+        self.stamp_tech_ctrl_edit = self._make_person_combo([])
+        self.stamp_norm_ctrl_edit = self._make_person_combo([])
+        self.stamp_approved_edit = self._make_person_combo(["Сизонов", "Заметалин"])
         self.stamp_date_edit = QLineEdit()
-        self.stamp_order_edit = QLineEdit()
-
-        # Предзаполненные значения ФИО (можно изменить вручную)
-        self.stamp_developer_edit.setText("Воробьев")
-        self.stamp_checker_edit.setText("Заметалин")
-        self.stamp_approved_edit.setText("Сизонов")
 
         self.stamp_developer_edit.setPlaceholderText("Разраб. (ячейка 110)")
         self.stamp_checker_edit.setPlaceholderText("Пров. (ячейка 111)")
@@ -290,19 +349,23 @@ class MainWindow(QMainWindow):
         self.stamp_material_thickness_combo.addItems(["", "6", "5", "4", "3", "2", "1"])
         self.stamp_material_type_combo.addItems([
             "",
+            "Конструкции металлические деталировочные",
             "09Г2С ГОСТ 19281-2014",
             "AISI 304",
             "Ст3. ГОСТ 19281-2014",
         ])
         self.stamp_material_edit.setPlaceholderText(
-            "Материал (ячейка 3, для несборочных). Формируется из толщины и типа."
+            "Материал (ячейка 3). Можно ввести вручную или выбрать тип выше."
         )
         self.stamp_tech_ctrl_edit.setPlaceholderText("Т. контр. (ячейка 112)")
         self.stamp_norm_ctrl_edit.setPlaceholderText("Н. контр. (ячейка 114)")
         self.stamp_approved_edit.setPlaceholderText("Утв. (ячейка 115)")
-        self.stamp_date_edit.setPlaceholderText("Дата разработки (ячейка 130, формат 01.01.2026)")
-        self.stamp_order_edit.setPlaceholderText("Номер заказа (опционально, пока без логики)")
+        self.stamp_date_edit.setPlaceholderText("Дата (ячейка 130, формат 01.01.2026)")
 
+        stamp_form.addRow("Обозначение:", self.stamp_designation_edit)
+        stamp_form.addRow("Наименование:", self.stamp_name_edit)
+        stamp_form.addRow("", self.stamp_sheet_auto_check)
+        stamp_form.addRow("Листы:", sheet_row)
         stamp_form.addRow("Разработал:", self.stamp_developer_edit)
         stamp_form.addRow("Проверил:", self.stamp_checker_edit)
         stamp_form.addRow("Организация:", self.stamp_org_edit)
@@ -319,9 +382,28 @@ class MainWindow(QMainWindow):
         stamp_form.addRow("Н. контр.:", self.stamp_norm_ctrl_edit)
         stamp_form.addRow("Утв.:", self.stamp_approved_edit)
         stamp_form.addRow("Дата:", self.stamp_date_edit)
-        stamp_form.addRow("Заказ:", self.stamp_order_edit)
-
         stamp_layout.addLayout(stamp_form)
+
+        hint_stamp = QLabel(
+            "Номера ячеек штампа ГОСТ 2.104 заданы в src/core/stamp_cells.py. "
+            "Для материала используется формат КОМПАС: $d ... ; ... $."
+        )
+        hint_stamp.setWordWrap(True)
+        hint_stamp.setStyleSheet("color: palette(mid); font-size: 11px;")
+        stamp_layout.addWidget(hint_stamp)
+
+        sheet_auto_group = QGroupBox("Автонумерация листов")
+        sheet_auto_layout = QHBoxLayout(sheet_auto_group)
+        self.stamp_sheet_folder_edit = QLineEdit()
+        self.stamp_sheet_folder_edit.setPlaceholderText("Папка чертежей (.cdw); по умолчанию Папка проекта")
+        self.btn_sheet_folder_browse = QPushButton("Папка чертежей...")
+        self.btn_sheet_folder_browse.clicked.connect(self._browse_sheet_folder)
+        self.btn_auto_number_sheets = QPushButton("Пронумеровать листы")
+        self.btn_auto_number_sheets.clicked.connect(self._on_auto_number_sheets_clicked)
+        sheet_auto_layout.addWidget(self.stamp_sheet_folder_edit, stretch=1)
+        sheet_auto_layout.addWidget(self.btn_sheet_folder_browse)
+        sheet_auto_layout.addWidget(self.btn_auto_number_sheets)
+        stamp_layout.addWidget(sheet_auto_group)
 
         stamp_buttons_row = QHBoxLayout()
         self.btn_update_stamps = QPushButton("Обновить штампы чертежей")
@@ -452,32 +534,25 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         status.showMessage("Готов к работе. Выберите папку проекта.")
 
-    def _fill_profiles(self) -> None:
-        """
-        Заполнить список профилей теми типами, которые вы перечислили.
-        При расширении логики обозначений достаточно будет обновить этот список.
-        """
-        profiles = [
-            # H-серия
+    @staticmethod
+    def _profile_choices() -> list[str]:
+        return [
             "Профиль H20.1",
             "Профиль H20",
             "Профиль H21",
             "Профиль H22",
             "Профиль H23",
             "Профиль H24",
-            # DT
             "Профиль DT20",
             "Профиль DT21",
             "Профиль DT22",
             "Профиль DT23",
             "Профиль DT24",
-            # H Hat
             "Профиль H Hat20",
             "Профиль H Hat21",
             "Профиль H Hat22",
             "Профиль H Hat23",
             "Профиль H Hat24",
-            # T-серия
             "Профиль T12",
             "Профиль T15",
             "Профиль T16",
@@ -487,14 +562,99 @@ class MainWindow(QMainWindow):
             "Профиль T21",
             "Профиль T Hat20",
             "Профиль T11N",
-            # L-серия
             "Профиль L11N",
             "Профиль L20",
             "Профиль L15",
             "Профиль L16",
         ]
-        self.profile_combo.clear()
-        self.profile_combo.addItems(profiles)
+
+    def _fill_profile_combo(self, combo: QComboBox) -> None:
+        combo.clear()
+        combo.addItems(self._profile_choices())
+
+    def _make_person_combo(self, suggestions: list[str]) -> QComboBox:
+        c = QComboBox()
+        c.setEditable(True)
+        c.addItem("")
+        for s in suggestions:
+            if s:
+                c.addItem(s)
+        le = c.lineEdit()
+        if le is not None:
+            le.setPlaceholderText("Фамилия или выбор из списка")
+        return c
+
+    @staticmethod
+    def _transliterate_latin_token_to_ru(token: str) -> str:
+        """
+        Мягкая транслитерация латиницы в кириллицу для заголовков блоков.
+        Не зависит от фиксированного набора имен блоков.
+        """
+        s = token
+        low = s.lower()
+        pairs = [
+            ("shch", "щ"),
+            ("zh", "ж"),
+            ("kh", "х"),
+            ("ts", "ц"),
+            ("ch", "ч"),
+            ("sh", "ш"),
+            ("yu", "ю"),
+            ("ya", "я"),
+            ("yo", "ё"),
+        ]
+        out = ""
+        i = 0
+        while i < len(low):
+            matched = False
+            for src, dst in pairs:
+                if low.startswith(src, i):
+                    out += dst
+                    i += len(src)
+                    matched = True
+                    break
+            if matched:
+                continue
+            ch = low[i]
+            one = {
+                "a": "а", "b": "б", "c": "к", "d": "д", "e": "е",
+                "f": "ф", "g": "г", "h": "х", "i": "и", "j": "й",
+                "k": "к", "l": "л", "m": "м", "n": "н", "o": "о",
+                "p": "п", "q": "к", "r": "р", "s": "с", "t": "т",
+                "u": "у", "v": "в", "w": "в", "x": "кс", "y": "ы", "z": "з",
+                "_": " ",
+            }.get(ch, ch)
+            out += one
+            i += 1
+        return out.strip().capitalize()
+
+    def _humanize_block_title(self, block_id: str) -> str:
+        txt = (block_id or "").strip()
+        if not txt:
+            return "Прочие"
+        # split camel case + underscores
+        import re as _re
+        txt = _re.sub(r"(?<!^)([A-ZА-Я])", r" \1", txt).replace("_", " ")
+        txt = " ".join(txt.split())
+        # Если токен латиницей, пробуем транслитерировать.
+        parts = []
+        for t in txt.split(" "):
+            if t and all(("a" <= c.lower() <= "z") or c.isdigit() for c in t):
+                parts.append(self._transliterate_latin_token_to_ru(t))
+            else:
+                parts.append(t.capitalize())
+        return " ".join(parts)
+
+    def _sync_assembly_and_stamp_fields(self) -> None:
+        """Заполнить поля обозначения/наименования из текущей сборки и продублировать в штамп."""
+        if not self._assembly_info:
+            return
+        des = self._assembly_info.designation or ""
+        name = self._assembly_info.name or ""
+        self.assembly_designation_edit.setText(des)
+        self.assembly_name_edit.setText(name)
+        self.stamp_designation_edit.setText(des)
+        self.stamp_name_edit.setText(name)
 
     # ------------------------------------------------------------------
     # Обработчики
@@ -532,6 +692,7 @@ class MainWindow(QMainWindow):
             self._documents = documents
             self._var_index = var_index
             self._rebuild_variables_form()
+            self._sync_assembly_and_stamp_fields()
 
             # Сохраняем сводное состояние в JSON-лог
             if self._json_log:
@@ -562,16 +723,13 @@ class MainWindow(QMainWindow):
 
     def _rebuild_variables_form(self) -> None:
         """Перестроить форму переменных на вкладке 'Переменные'."""
-        # Очищаем предыдущие блоки
-        while self.vars_blocks_layout.count():
-            item = self.vars_blocks_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
+        # Очищаем предыдущие вкладки с блоками
+        while self.vars_toolbox.count() > 0:
+            page = self.vars_toolbox.widget(0)
+            self.vars_toolbox.removeItem(0)
+            if page is not None:
+                page.deleteLater()
         self._var_inputs.clear()
-        self._block_profile_combos.clear()
-        self._block_designation_edits.clear()
-        self._block_name_edits.clear()
         self._drawing_comment_inputs.clear()
 
         # Группируем переменные сборки по block_id
@@ -586,50 +744,21 @@ class MainWindow(QMainWindow):
         for name, kv in self._var_index.items():
             if kv.document_type != "assembly":
                 continue
-            if kv.block_id:
-                blocks.setdefault(kv.block_id, {})[name] = kv
+            normalized_block = (kv.block_id or "").rstrip("_").strip()
+            if normalized_block:
+                blocks.setdefault(normalized_block, {})[name] = kv
             else:
                 ungrouped[name] = kv
 
         # Создаем блоки
         for block_id, vars_in_block in sorted(blocks.items(), key=lambda x: x[0].lower()):
             logger.info("[UI] Блок переменных: %s", block_id)
-            group = QGroupBox(block_id)
+            block_title = self._humanize_block_title(block_id)
+            group = QGroupBox(block_title)
             group.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             group.setStyleSheet("QGroupBox { font-weight: bold; }")
 
             vbox = QVBoxLayout(group)
-
-            # Верхняя строка: выбор профиля + автообозначение/наименование
-            header_row = QHBoxLayout()
-            lbl_prof = QLabel("Профиль:")
-            combo = QComboBox()
-            combo.addItems(self.profile_combo.itemText(i) for i in range(self.profile_combo.count()))
-
-            lbl_des = QLabel("Обозначение:")
-            des_edit = QLineEdit()
-            lbl_name = QLabel("Наименование:")
-            name_edit = QLineEdit()
-
-            header_row.addWidget(lbl_prof)
-            header_row.addWidget(combo)
-            header_row.addWidget(lbl_des)
-            header_row.addWidget(des_edit)
-            header_row.addWidget(lbl_name)
-            header_row.addWidget(name_edit)
-
-            vbox.addLayout(header_row)
-
-            self._block_profile_combos[block_id] = combo
-            self._block_designation_edits[block_id] = des_edit
-            self._block_name_edits[block_id] = name_edit
-
-            # Автозаполнение обозначения/наименования из сборки/деталей
-            default_des, default_name = self._get_default_designation_name_for_block(block_id)
-            if default_des:
-                des_edit.setText(default_des)
-            if default_name:
-                name_edit.setText(default_name)
 
             # Формы переменных блока
             form = QFormLayout()
@@ -654,8 +783,7 @@ class MainWindow(QMainWindow):
                 self._var_inputs[name] = edit
 
             vbox.addLayout(form)
-
-            self.vars_blocks_layout.addWidget(group)
+            self.vars_toolbox.addItem(group, block_title)
 
         # Блок "Прочие" для переменных без блока
         if ungrouped:
@@ -679,7 +807,7 @@ class MainWindow(QMainWindow):
                 form.addRow(label, edit)
                 self._var_inputs[name] = edit
             vbox.addLayout(form)
-            self.vars_blocks_layout.addWidget(group)
+            self.vars_toolbox.addItem(group, "Прочие")
 
         # Отдельный блок для переменных чертежей (комментарии)
         drawing_vars: Dict[str, KompasVariable] = {}
@@ -721,18 +849,16 @@ class MainWindow(QMainWindow):
                 )
 
             vbox.addLayout(form)
-            self.vars_blocks_layout.addWidget(group)
-
-        self.vars_blocks_layout.addStretch(1)
+            self.vars_toolbox.addItem(group, "Переменные чертежа")
 
         # После перестройки формы переменных обновляем и таблицу деталей/подсборок
         self._rebuild_items_table()
 
     def _rebuild_items_table(self) -> None:
         """
-        Построить таблицу уникальных деталей/подсборок:
+        Построить таблицу деталей/подсборок:
         - используем только документы текущего уровня (assembly_info + parts из self._documents);
-        - объединяем по ключу (тип, обозначение, наименование), чтобы метизы не дублировались.
+        - каждая строка соответствует конкретному файлу (без дедупликации по mark/name).
         """
         self._assembly_items.clear()
         self._assembly_item_new_marking.clear()
@@ -746,11 +872,7 @@ class MainWindow(QMainWindow):
         def add_item(doc: KompasDocumentInfo) -> None:
             if doc.doc_type not in ("assembly", "part"):
                 return
-            doc_type = doc.doc_type
-            mark = doc.designation or ""
-            name = doc.name or ""
-            key = (doc_type, mark, name)
-            # Один элемент на ключ (тип + обозначение + наименование)
+            key = doc.path
             if key not in self._assembly_items:
                 self._assembly_items[key] = doc
 
@@ -765,8 +887,10 @@ class MainWindow(QMainWindow):
 
         self.items_table.setRowCount(len(self._assembly_items))
 
-        for row, (key, doc) in enumerate(self._assembly_items.items()):
-            doc_type, mark, name = key
+        for row, (doc_path, doc) in enumerate(self._assembly_items.items()):
+            doc_type = doc.doc_type
+            mark = doc.designation or ""
+            name = doc.name or ""
 
             # Тип
             if doc_type == "assembly":
@@ -792,12 +916,12 @@ class MainWindow(QMainWindow):
             # Новое обозначение
             new_mark_edit = QLineEdit()
             self.items_table.setCellWidget(row, 3, new_mark_edit)
-            self._assembly_item_new_marking[key] = new_mark_edit
+            self._assembly_item_new_marking[doc_path] = new_mark_edit
 
             # Новое наименование
             new_name_edit = QLineEdit()
             self.items_table.setCellWidget(row, 4, new_name_edit)
-            self._assembly_item_new_name[key] = new_name_edit
+            self._assembly_item_new_name[doc_path] = new_name_edit
 
             # Файл
             file_item = QTableWidgetItem(str(doc.path.name))
@@ -813,49 +937,774 @@ class MainWindow(QMainWindow):
                 doc.path,
             )
 
-    def _get_default_designation_name_for_block(self, block_id: str) -> tuple[str | None, str | None]:
+    def _fill_item_metadata_by_rules(self) -> Dict[str, int]:
         """
-        Попробовать подобрать разумное обозначение/наименование для блока,
-        исходя из данных сборки и деталей.
-
-        Логика первого приближения:
-        - Obolochka: деталь с "оболочка" в имени;
-        - Rigel: деталь с "ригель" в имени;
-        - Stoiki: деталь с "стойка" в имени;
-        - Kronshtein_MacFox: деталь с "macfox" в имени;
-        - иначе — обозначение/имя сборки.
+        Заполнить колонки «Новое обозначение/наименование» по ролям
+        и текущим (уже пересчитанным) значениям переменных сборки.
         """
-        block_lower = block_id.lower()
+        profile = self.items_profile_combo.currentText().strip()
+        try:
+            series = int(self.items_series_combo.currentText())
+        except ValueError:
+            series = 1
+        var_values = collect_assembly_numeric_values(self._var_index)
+        filled_mark = 0
+        filled_name = 0
+        for doc_path, mark_edit in self._assembly_item_new_marking.items():
+            doc = self._assembly_items.get(doc_path)
+            if doc is None:
+                continue
+            doc_type = doc.doc_type
+            cur_mark = doc.designation or ""
+            name = doc.name or ""
+            doc_name = doc.path.name if doc is not None else "<unknown>"
+            # КРИТИЧНО: сначала определяем роль по имени файла детали (более стабильно),
+            # затем по name, и только в конце — по префиксу marking.
+            if doc is not None:
+                role = infer_role_from_part_name(doc.path.stem)
+            else:
+                role = None
+            if not role:
+                role = infer_role_from_part_name(name or "")
+            if not role and cur_mark:
+                up = cur_mark.upper()
+                if up.startswith("Р-"):
+                    role = "rigel"
+                elif up.startswith("СС-"):
+                    role = "stoika_srednyaya"
+                elif up.startswith("СК-"):
+                    role = "stoika_kraynaya"
+            if not role:
+                logger.info(
+                    "[Items][Rules] skip: file=%s type=%s cur_mark=%r name=%r role=not-detected",
+                    doc_name,
+                    doc_type,
+                    cur_mark,
+                    name,
+                )
+                continue
+            logger.info(
+                "[Items][Rules] role: file=%s type=%s cur_mark=%r name=%r -> role=%s",
+                doc_name,
+                doc_type,
+                cur_mark,
+                name,
+                role,
+            )
+            if profile:
+                des = build_element_designation(role, series, profile, var_values)
+                if des:
+                    mark_edit.setText(des)
+                    filled_mark += 1
+                    logger.info(
+                        "[Items][Rules] marking: file=%s role=%s -> %r",
+                        doc_name,
+                        role,
+                        des,
+                    )
+                else:
+                    logger.info(
+                        "[Items][Rules] marking-skip: file=%s role=%s reason=no-designation",
+                        doc_name,
+                        role,
+                    )
+            name_edit = self._assembly_item_new_name.get(doc_path)
+            if name_edit is not None:
+                new_name = build_element_name(role, profile, var_values) if profile else None
+                if new_name:
+                    m = re.search(r"[НH]\d+(?:\.\d+)?", name or "", flags=re.IGNORECASE)
+                    if m:
+                        cur_profile = m.group(0).upper().replace("H", "Н")
+                        new_name = re.sub(
+                            r"Профиль\s+[НH]\d+(?:\.\d+)?",
+                            f"Профиль {cur_profile}",
+                            new_name,
+                            flags=re.IGNORECASE,
+                        )
+                    name_edit.setText(new_name)
+                    filled_name += 1
+                    logger.info(
+                        "[Items][Rules] name: file=%s role=%s -> %r",
+                        doc_name,
+                        role,
+                        new_name,
+                    )
+                else:
+                    logger.info(
+                        "[Items][Rules] name-skip: file=%s role=%s reason=no-name",
+                        doc_name,
+                        role,
+                    )
+        # Сборка: прокидываем поля из шапки в колонку "новое", чтобы применялось в файл и UI.
+        for doc_path, mark_edit in self._assembly_item_new_marking.items():
+            doc = self._assembly_items.get(doc_path)
+            if doc is None or doc.doc_type != "assembly":
+                continue
+            asm_mark = self.assembly_designation_edit.text().strip()
+            asm_name = self.assembly_name_edit.text().strip()
+            if asm_mark:
+                mark_edit.setText(asm_mark)
+                filled_mark += 1
+                logger.info("[Items][Rules] assembly marking -> %r", asm_mark)
+            name_edit = self._assembly_item_new_name.get(doc_path)
+            if name_edit is not None and asm_name:
+                name_edit.setText(asm_name)
+                filled_name += 1
+                logger.info("[Items][Rules] assembly name -> %r", asm_name)
+            break
+        logger.info(
+            "[Items] Автозаполнение по правилам: обозначений=%d, наименований=%d",
+            filled_mark,
+            filled_name,
+        )
+        return {"markings": filled_mark, "names": filled_name}
 
-        # 1. Пытаемся найти подходящую деталь
-        if self._documents:
-            for doc in self._documents:
-                if doc.doc_type != "part":
+    def _on_apply_designation_rules(self) -> None:
+        """Заполнить колонки «Новое обозначение/наименование» по правилам."""
+        if not self._assembly_info:
+            QMessageBox.warning(self, "Нет проекта", "Сначала выберите и просканируйте проект.")
+            return
+        profile = self.items_profile_combo.currentText().strip()
+        if not profile:
+            QMessageBox.warning(self, "Профиль", "Выберите профиль для правил обозначения/наименования.")
+            return
+        filled = self._fill_item_metadata_by_rules()
+        self.statusBar().showMessage(
+            f"Подставлено по правилам: обозначений {filled['markings']}, наименований {filled['names']}.",
+            5000,
+        )
+        if filled["markings"] == 0 and filled["names"] == 0:
+            QMessageBox.information(
+                self,
+                "Нет совпадений",
+                "Не удалось сопоставить детали с ролями СК/СС/Р "
+                "или не хватает длины в переменных сборки.",
+            )
+
+    def _collect_item_metadata_payload(self) -> Dict[Path, Dict[str, str]]:
+        """
+        Собрать непустые значения из колонок «Новое обозначение/наименование».
+        Возвращает: путь_документа -> {"marking": "...", "name": "..."}.
+        """
+        updates: Dict[Path, Dict[str, str]] = {}
+        for doc_path, doc in self._assembly_items.items():
+            mark_edit = self._assembly_item_new_marking.get(doc_path)
+            name_edit = self._assembly_item_new_name.get(doc_path)
+            if not mark_edit and not name_edit:
+                continue
+            new_mark = (mark_edit.text().strip() if mark_edit else "")
+            new_name = (name_edit.text().strip() if name_edit else "")
+            if not new_mark and not new_name:
+                continue
+            payload: Dict[str, str] = {}
+            if new_mark:
+                payload["marking"] = new_mark
+            if new_name:
+                payload["name"] = new_name
+            updates[doc.path] = payload
+        return updates
+
+    def _apply_item_metadata_updates(
+        self,
+        updates: Dict[Path, Dict[str, str]],
+        *,
+        sync_assembly_components: bool = False,
+    ) -> Dict[str, object]:
+        """
+        Записать обозначение/наименование в документы 3D.
+        """
+        def _read_part_prop(i_part: object, low_name: str, pascal_name: str) -> object:
+            value = None
+            try:
+                value = getattr(i_part, low_name, None)
+            except Exception:
+                value = None
+            if value in (None, ""):
+                try:
+                    value = getattr(i_part, pascal_name, None)
+                except Exception:
+                    value = None
+            return value
+
+        def _write_part_prop(i_part: object, low_name: str, pascal_name: str, value: str) -> tuple[bool, str]:
+            wrote = False
+            used = ""
+            try:
+                setattr(i_part, low_name, value)
+                wrote = True
+                used = low_name
+            except Exception:
+                pass
+            try:
+                setattr(i_part, pascal_name, value)
+                wrote = True
+                used = f"{used}+{pascal_name}" if used else pascal_name
+            except Exception:
+                pass
+            return wrote, used
+
+        def _sync_assembly_component_metadata(
+            assembly_path: Path,
+            updates_by_path: Dict[Path, Dict[str, str]],
+        ) -> tuple[int, int, list[str]]:
+            local_errors: list[str] = []
+            logger.info("[Assembly][probe] sync func enter: assembly=%s, updates=%d", assembly_path, len(updates_by_path))
+            by_old_marking: Dict[str, Dict[str, str]] = {}
+            by_old_pair: Dict[tuple[str, str], Dict[str, str]] = {}
+            # ISOLATED MODE: берём только изменённые позиции и не обходим всю таблицу элементов.
+            # Это снижает риск сбоя в ранней фазе sync.
+            for doc_path, payload in updates_by_path.items():
+                doc = self._assembly_items.get(doc_path)
+                if not doc or doc.doc_type != "part" or doc_path.suffix.lower() != ".m3d":
                     continue
-                name = (doc.name or "").lower()
-                path_name = doc.path.name.lower()
+                old_mark = str(doc.marking or "").strip()
+                old_name = str(doc.name or "").strip()
+                if old_mark:
+                    by_old_marking.setdefault(old_mark, payload)
+                if old_mark or old_name:
+                    by_old_pair.setdefault((old_mark, old_name), payload)
+            logger.info(
+                "[Assembly][probe] maps prepared: by_old_marking=%d, by_old_pair=%d",
+                len(by_old_marking),
+                len(by_old_pair),
+            )
 
-                if "obolochka" in block_lower or "оболоч" in block_lower:
-                    if "оболочка" in name or "оболочка" in path_name:
-                        return doc.designation, doc.name
+            def _iter_components_probe(root_part: object, max_top: int = 12):
+                # DIAG MODE: только верхний уровень и короткий лимит, чтобы локализовать crash.
+                logger.info("[Assembly][probe] iterate top-level start, max_top=%d", max_top)
+                for idx in range(max_top):
+                    logger.info("[Assembly][probe] GetPart(%d): before", idx)
+                    try:
+                        child = root_part.GetPart(idx)
+                    except Exception as exc:
+                        logger.warning("[Assembly][probe] GetPart(%d): exception: %s", idx, exc)
+                        break
+                    if not child:
+                        logger.info("[Assembly][probe] GetPart(%d): empty, stop", idx)
+                        break
+                    logger.info("[Assembly][probe] GetPart(%d): ok", idx)
+                    yield child
+                logger.info("[Assembly][probe] iterate top-level done")
 
-                if "rigel" in block_lower or "ригель" in block_lower:
-                    if "ригель" in name or "ригель" in path_name:
-                        return doc.designation, doc.name
+            def _component_tag(comp: object) -> str:
+                # SAFE MODE: не обращаемся к потенциально нестабильным FileName/FullName.
+                cur_name = str(_read_part_prop(comp, "name", "Name") or "").strip()
+                cur_mark = str(_read_part_prop(comp, "marking", "Marking") or "").strip()
+                if cur_name:
+                    return cur_name
+                if cur_mark:
+                    return cur_mark
+                return "<component>"
 
-                if "stoik" in block_lower or "стойк" in block_lower:
-                    if "стойка" in name or "стойка" in path_name:
-                        return doc.designation, doc.name
+            def _payload_for_component(comp: object) -> tuple[Dict[str, str] | None, str]:
+                cur_mark = str(_read_part_prop(comp, "marking", "Marking") or "").strip()
+                cur_name = str(_read_part_prop(comp, "name", "Name") or "").strip()
+                by_mark = by_old_marking.get(cur_mark)
+                if by_mark:
+                    return by_mark, f"old-marking={cur_mark}"
+                by_old = by_old_pair.get((cur_mark, cur_name))
+                if by_old:
+                    return by_old, f"old-pair={cur_mark}|{cur_name}"
+                return None, "no-match"
 
-                if "kronshtein_macfox" in block_lower or "macfox" in block_lower:
-                    if "macfox" in name or "macfox" in path_name:
-                        return doc.designation, doc.name
+            logger.info("[Assembly][probe] open assembly: %s", assembly_path)
+            if not self._kompas.open_document(str(assembly_path)):
+                return 0, 0, [f"Не удалось открыть сборку для синхронизации компонентов: {assembly_path}"]
+            logger.info("[Assembly][probe] open assembly: ok")
 
-        # 2. Фолбэк — обозначение и наименование сборки (если есть)
-        if self._assembly_info:
-            return self._assembly_info.designation, self._assembly_info.name
+            components_updated = 0
+            fields_updated_local = 0
+            save_on_close_local = False
+            visited_components = 0
+            matched_components = 0
+            try:
+                logger.info("[Assembly][probe] api get start")
+                api5 = self._kompas.get_api5()
+                api7 = self._kompas.get_api7()
+                if api5 is None or api7 is None:
+                    return 0, 0, ["API5/API7 недоступны для синхронизации компонентов сборки"]
+                logger.info("[Assembly][probe] api get ok")
 
-        return None, None
+                logger.info("[Assembly][probe] ActiveDocument3D read start")
+                i_doc3d = getattr(api5, "ActiveDocument3D", None)
+                if not i_doc3d:
+                    return 0, 0, ["ActiveDocument3D не найден для синхронизации компонентов сборки"]
+                logger.info("[Assembly][probe] ActiveDocument3D read ok")
+                logger.info("[Assembly][probe] GetPart(-1) start")
+                i_asm = i_doc3d.GetPart(-1)
+                if not i_asm:
+                    return 0, 0, ["GetPart(-1) для сборки вернул пустой объект"]
+                logger.info("[Assembly][probe] GetPart(-1) ok")
+
+                for comp in _iter_components_probe(i_asm):
+                    visited_components += 1
+                    payload, match_reason = _payload_for_component(comp)
+                    if not payload:
+                        continue
+                    matched_components += 1
+                    comp_tag = _component_tag(comp)
+
+                    changed_here = 0
+                    if "marking" in payload:
+                        old_mark = _read_part_prop(comp, "marking", "Marking")
+                        wrote = False
+                        used_prop = ""
+                        try:
+                            comp.marking = payload["marking"]
+                            wrote = True
+                            used_prop = "marking"
+                        except Exception:
+                            wrote, used_prop = _write_part_prop(comp, "marking", "Marking", payload["marking"])
+                        if not wrote:
+                            local_errors.append(f"[Assembly] {comp_tag}: не удалось записать marking")
+                        else:
+                            changed_here += 1
+                            if old_mark != payload["marking"]:
+                                logger.info(
+                                    "[Assembly] %s [%s]: marking(%s): %r -> %r",
+                                    comp_tag,
+                                    match_reason,
+                                    used_prop,
+                                    old_mark,
+                                    payload["marking"],
+                                )
+                            else:
+                                logger.info(
+                                    "[Assembly] %s [%s]: marking(%s): forced overwrite %r",
+                                    comp_tag,
+                                    match_reason,
+                                    used_prop,
+                                    payload["marking"],
+                                )
+
+                    if "name" in payload:
+                        old_name = _read_part_prop(comp, "name", "Name")
+                        wrote = False
+                        used_prop = ""
+                        try:
+                            comp.name = payload["name"]
+                            wrote = True
+                            used_prop = "name"
+                        except Exception:
+                            wrote, used_prop = _write_part_prop(comp, "name", "Name", payload["name"])
+                        if not wrote:
+                            local_errors.append(f"[Assembly] {comp_tag}: не удалось записать name")
+                        else:
+                            changed_here += 1
+                            if old_name != payload["name"]:
+                                logger.info(
+                                    "[Assembly] %s [%s]: name(%s): %r -> %r",
+                                    comp_tag,
+                                    match_reason,
+                                    used_prop,
+                                    old_name,
+                                    payload["name"],
+                                )
+                            else:
+                                logger.info(
+                                    "[Assembly] %s [%s]: name(%s): forced overwrite %r",
+                                    comp_tag,
+                                    match_reason,
+                                    used_prop,
+                                    payload["name"],
+                                )
+
+                    if changed_here > 0:
+                        try:
+                            comp.Update()
+                        except Exception:
+                            pass
+                        try:
+                            comp.RebuildModel()
+                        except Exception:
+                            pass
+                        fields_updated_local += changed_here
+                        components_updated += 1
+                        save_on_close_local = True
+
+                if save_on_close_local:
+                    try:
+                        i_asm.Update()
+                    except Exception:
+                        pass
+                    try:
+                        i_doc3d.RebuildDocument()
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                    try:
+                        api7.ActiveDocument.Save()
+                    except Exception as exc:
+                        local_errors.append(f"Сборка: ошибка Save после синхронизации вхождений: {exc}")
+                    time.sleep(0.3)
+                logger.info(
+                    "[Assembly] sync stats: visited=%d, matched=%d, updated=%d, fields=%d",
+                    visited_components,
+                    matched_components,
+                    components_updated,
+                    fields_updated_local,
+                )
+            except Exception as exc:
+                local_errors.append(f"Синхронизация компонентов сборки: {exc}")
+            finally:
+                self._kompas.close_active_document(save=save_on_close_local)
+
+            # SAFE MODE: пропускаем повторный глубокий reopen-check, чтобы избежать COM-crash.
+            # Фактическая проверка будет выполнена стандартным пересканом проекта после операции.
+
+            return components_updated, fields_updated_local, local_errors
+
+        result: Dict[str, object] = {
+            "success": False,
+            "documents_updated": 0,
+            "fields_updated": 0,
+            "errors": [],
+        }
+        errors: list[str] = []
+        docs_updated = 0
+        fields_updated = 0
+
+        # Шаг 1: сначала синхронизируем вхождения деталей внутри сборки (.a3d),
+        # чтобы состояние сборки фиксировалось до прохода по файлам деталей.
+        if sync_assembly_components and self._assembly_info and self._assembly_info.path.exists():
+            part_updates: Dict[Path, Dict[str, str]] = {
+                p: payload
+                for p, payload in updates.items()
+                if p.suffix.lower() == ".m3d"
+            }
+            if part_updates:
+                logger.info(
+                    "[Assembly] sync start: assembly=%s, part_updates=%d",
+                    self._assembly_info.path,
+                    len(part_updates),
+                )
+                comp_docs, comp_fields, comp_errors = _sync_assembly_component_metadata(
+                    self._assembly_info.path,
+                    part_updates,
+                )
+                docs_updated += comp_docs
+                fields_updated += comp_fields
+                errors.extend(comp_errors)
+
+        # Шаг 2: обновляем сами документы деталей.
+        for path, payload in updates.items():
+            if not self._kompas.open_document(str(path)):
+                errors.append(f"Не удалось открыть документ: {path}")
+                continue
+            save_on_close = False
+            try:
+                api5 = self._kompas.get_api5()
+                api7 = self._kompas.get_api7()
+                if api5 is None or api7 is None:
+                    errors.append("API5/API7 недоступны для обновления обозначения/наименования")
+                    continue
+                i_doc3d = getattr(api5, "ActiveDocument3D", None)
+                if not i_doc3d:
+                    errors.append(f"{path.name}: ActiveDocument3D не найден")
+                    continue
+                i_part = i_doc3d.GetPart(-1)
+                changed_here = 0
+
+                if "marking" in payload:
+                    old_mark = _read_part_prop(i_part, "marking", "Marking")
+                    wrote = False
+                    used_prop = ""
+                    try:
+                        i_part.marking = payload["marking"]
+                        wrote = True
+                        used_prop = "marking"
+                    except Exception:
+                        wrote, used_prop = _write_part_prop(i_part, "marking", "Marking", payload["marking"])
+                    if not wrote:
+                        errors.append(f"{path.name}: не удалось записать marking в COM-свойства part")
+                    else:
+                        changed_here += 1
+                        if old_mark != payload["marking"]:
+                            logger.info(
+                                "%s: marking(%s): %r -> %r",
+                                path.name,
+                                used_prop,
+                                old_mark,
+                                payload["marking"],
+                            )
+                        else:
+                            logger.info(
+                                "%s: marking(%s): forced overwrite %r",
+                                path.name,
+                                used_prop,
+                                payload["marking"],
+                            )
+                if "name" in payload:
+                    old_name = _read_part_prop(i_part, "name", "Name")
+                    wrote = False
+                    used_prop = ""
+                    try:
+                        i_part.name = payload["name"]
+                        wrote = True
+                        used_prop = "name"
+                    except Exception:
+                        wrote, used_prop = _write_part_prop(i_part, "name", "Name", payload["name"])
+                    if not wrote:
+                        errors.append(f"{path.name}: не удалось записать name в COM-свойства part")
+                    else:
+                        changed_here += 1
+                        if old_name != payload["name"]:
+                            logger.info(
+                                "%s: name(%s): %r -> %r",
+                                path.name,
+                                used_prop,
+                                old_name,
+                                payload["name"],
+                            )
+                        else:
+                            logger.info(
+                                "%s: name(%s): forced overwrite %r",
+                                path.name,
+                                used_prop,
+                                payload["name"],
+                            )
+
+                if changed_here > 0:
+                    try:
+                        i_part.Update()
+                    except Exception:
+                        pass
+                    try:
+                        i_part.RebuildModel()
+                    except Exception:
+                        pass
+                    try:
+                        i_doc3d.RebuildDocument()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    api7.ActiveDocument.Save()
+                    time.sleep(0.2)
+                    save_on_close = True
+                    # Read-back в той же сессии документа: подтверждаем фактическую запись.
+                    rb_mark = _read_part_prop(i_part, "marking", "Marking")
+                    rb_name = _read_part_prop(i_part, "name", "Name")
+                    if "marking" in payload and rb_mark != payload["marking"]:
+                        errors.append(
+                            f"{path.name}: marking read-back mismatch: {rb_mark!r} != {payload['marking']!r}"
+                        )
+                    if "name" in payload and rb_name != payload["name"]:
+                        errors.append(
+                            f"{path.name}: name read-back mismatch: {rb_name!r} != {payload['name']!r}"
+                        )
+                    docs_updated += 1
+                    fields_updated += changed_here
+            except Exception as exc:
+                errors.append(f"{path.name}: ошибка обновления обозначения/наименования: {exc}")
+            finally:
+                self._kompas.close_active_document(save=save_on_close)
+
+        result["documents_updated"] = docs_updated
+        result["fields_updated"] = fields_updated
+        result["errors"] = errors
+        result["success"] = len(errors) == 0
+        return result
+
+    def _on_apply_items_meta_clicked(self) -> None:
+        updates = self._collect_item_metadata_payload()
+        if not updates:
+            QMessageBox.information(
+                self,
+                "Нет данных",
+                "Заполните хотя бы одно поле в колонках «Новое обозначение» / «Новое наименование».",
+            )
+            return
+        result = self._apply_item_metadata_updates(updates, sync_assembly_components=False)
+        # COM в КОМПАС может падать при плотной серии операций. Небольшая пауза
+        # перед isolated subprocess заметно снижает вероятность аварии UI-процесса.
+        time.sleep(0.8)
+        # После записи в детали/сборку-файл дополнительно синхронизируем вхождения в .a3d
+        # через изолированный subprocess (безопаснее для UI-процесса).
+        sync_result = self._run_isolated_assembly_sync(updates)
+
+        apply_errors = list(result.get("errors") or [])
+        sync_errors = list(sync_result.get("errors") or [])
+        all_errors = apply_errors + sync_errors
+
+        if result.get("success") and sync_result.get("success"):
+            self.statusBar().showMessage(
+                f"Обозн./наимен. применены: документов={result.get('documents_updated')}, "
+                f"полей={result.get('fields_updated')}; "
+                f"вхождения сборки: документов={sync_result.get('documents_updated')}, "
+                f"полей={sync_result.get('fields_updated')}",
+                5000,
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Частичные ошибки",
+                "\n".join(str(e) for e in all_errors) if all_errors else "Операция завершена с ошибками.",
+            )
+        self._on_rescan_clicked()
+
+    def _on_sync_assembly_components_clicked(self) -> None:
+        """Отдельно синхронизировать вхождения деталей в сборке (.a3d)."""
+        updates = self._collect_item_metadata_payload()
+        if not updates:
+            # Если поля "новых" значений пусты, синхронизируем по текущим значениям деталей.
+            # Это позволяет отдельно "протолкнуть" marking/name в вхождения сборки без ручного ввода.
+            updates = {}
+            for doc_path, doc in self._assembly_items.items():
+                if doc.doc_type != "part" or doc_path.suffix.lower() != ".m3d":
+                    continue
+                cur_mark = str(doc.marking or "").strip()
+                cur_name = str(doc.name or "").strip()
+                payload: Dict[str, str] = {}
+                if cur_mark:
+                    payload["marking"] = cur_mark
+                if cur_name:
+                    payload["name"] = cur_name
+                if payload:
+                    updates[doc_path] = payload
+            if not updates:
+                QMessageBox.information(
+                    self,
+                    "Нет данных",
+                    "Нет значений marking/name для синхронизации вхождений сборки.",
+                )
+                return
+            logger.info("[Assembly][isolated] fallback updates prepared: %d", len(updates))
+        result = self._run_isolated_assembly_sync(updates)
+        if result.get("success"):
+            self.statusBar().showMessage(
+                f"Синхронизация сборки выполнена: документов={result.get('documents_updated')}, "
+                f"полей={result.get('fields_updated')}",
+                5000,
+            )
+            self._on_rescan_clicked()
+        else:
+            errors = result.get("errors") or []
+            QMessageBox.warning(
+                self,
+                "Частичные ошибки синхронизации",
+                "\n".join(str(e) for e in errors),
+            )
+
+    def _run_isolated_assembly_sync(self, updates: Dict[Path, Dict[str, str]]) -> Dict[str, object]:
+        """
+        Изолированный sync вхождений сборки в отдельном процессе.
+        Даже если в subprocess произойдёт COM-crash, UI-процесс останется жив.
+        """
+        result: Dict[str, object] = {
+            "success": False,
+            "documents_updated": 0,
+            "fields_updated": 0,
+            "errors": [],
+        }
+        errors: list[str] = []
+        if not self._assembly_info or not self._assembly_info.path.exists():
+            errors.append("Сборка не найдена для синхронизации.")
+            result["errors"] = errors
+            return result
+
+        items_payload: list[dict[str, str]] = []
+        for doc_path, payload in updates.items():
+            if doc_path.suffix.lower() != ".m3d":
+                continue
+            doc = self._assembly_items.get(doc_path)
+            if not doc:
+                continue
+            old_mark = str(doc.designation or "").strip()
+            old_name = str(doc.name or "").strip()
+            new_mark = str(payload.get("marking", "") or "").strip()
+            new_name = str(payload.get("name", "") or "").strip()
+            if not new_mark and not new_name:
+                continue
+            if not old_mark and not old_name:
+                continue
+            items_payload.append(
+                {
+                    "old_marking": old_mark,
+                    "old_name": old_name,
+                    "new_marking": new_mark,
+                    "new_name": new_name,
+                    "doc_path": str(doc_path),
+                    "file_stem": doc_path.stem,
+                }
+            )
+
+        if not items_payload:
+            result["success"] = True
+            return result
+
+        runner = Path(__file__).resolve().parents[1] / "core" / "assembly_sync_subprocess.py"
+        if not runner.exists():
+            errors.append(f"Не найден скрипт sync: {runner}")
+            result["errors"] = errors
+            return result
+
+        payload_data = {
+            "assembly_path": str(self._assembly_info.path),
+            "items": items_payload,
+        }
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as pf:
+                json.dump(payload_data, pf, ensure_ascii=False)
+                payload_file = Path(pf.name)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as rf:
+                rf.write("{}")
+                result_file = Path(rf.name)
+
+            cmd = [
+                sys.executable,
+                str(runner),
+                "--payload",
+                str(payload_file),
+                "--result",
+                str(result_file),
+            ]
+            logger.info("[Assembly][isolated] run: %s", " ".join(cmd))
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip()
+                stdout = (completed.stdout or "").strip()
+                msg = f"Isolated sync завершился с кодом {completed.returncode}."
+                if stderr:
+                    msg += f" stderr: {stderr}"
+                elif stdout:
+                    msg += f" stdout: {stdout}"
+                errors.append(msg)
+            try:
+                result_data = json.loads(result_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                result_data = {"success": False, "errors": [f"Не удалось прочитать результат isolated sync: {exc}"]}
+
+            result["success"] = bool(result_data.get("success", False)) and not errors
+            result["documents_updated"] = int(result_data.get("documents_updated", 0) or 0)
+            result["fields_updated"] = int(result_data.get("fields_updated", 0) or 0)
+            result["errors"] = errors + list(result_data.get("errors") or [])
+            visited = int(result_data.get("components_visited", 0) or 0)
+            matched = int(result_data.get("components_matched", 0) or 0)
+            logger.info(
+                "[Assembly][isolated] stats: visited=%d, matched=%d, updated=%d, fields=%d",
+                visited,
+                matched,
+                int(result["documents_updated"] or 0),
+                int(result["fields_updated"] or 0),
+            )
+            if result.get("success") and int(result["documents_updated"] or 0) == 0:
+                result["success"] = False
+                result["errors"] = list(result["errors"]) + [
+                    "Синхронизация вхождений не нашла ни одного совпадения в сборке "
+                    f"(visited={visited}, matched={matched}).",
+                ]
+            return result
+        except Exception as exc:
+            result["errors"] = [f"Ошибка запуска isolated sync: {exc}"]
+            return result
+        finally:
+            for p in ("payload_file", "result_file"):
+                fp = locals().get(p)
+                if isinstance(fp, Path):
+                    try:
+                        fp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     def _on_rescan_clicked(self) -> None:
         """Пересканировать текущий проект (подхватить внешние изменения)."""
@@ -869,6 +1718,7 @@ class MainWindow(QMainWindow):
             self._documents = documents
             self._var_index = var_index
             self._rebuild_variables_form()
+            self._sync_assembly_and_stamp_fields()
 
             if self._json_log:
                 state = {
@@ -908,6 +1758,17 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self.copy_target_edit.setText(folder)
+
+    def _browse_sheet_folder(self) -> None:
+        """Выбрать папку с чертежами для автонумерации листов."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку с чертежами",
+            str(self._current_project_root or ""),
+        )
+        if not folder:
+            return
+        self.stamp_sheet_folder_edit.setText(folder)
 
     def _copy_log_to_clipboard(self) -> None:
         """Скопировать весь текст лога в буфер обмена."""
@@ -1077,20 +1938,37 @@ class MainWindow(QMainWindow):
 
     def _on_copy_and_update_clicked(
         self,
-        prepared_payload: tuple[Dict[str, float], Dict[str, str]] | None = None,
+        prepared_payload: tuple[Dict[str, float], Dict[str, str]] | bool | None = None,
     ) -> None:
-        """Сценарий: копирование папки проекта и каскадное обновление в копии."""
+        """Сценарий: создать проект-копию (и опционально применить изменения переменных)."""
         if not self._current_project_root:
             QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
             return
 
-        payload = prepared_payload or self._collect_update_payload()
-        if payload is None:
-            return
-        changed_values, changed_comments = payload
-        if not changed_values and not changed_comments:
-            QMessageBox.information(self, "Нет изменений", "Вы не изменили ни одной переменной.")
-            return
+        changed_values: Dict[str, float] = {}
+        changed_comments: Dict[str, str] = {}
+        source_root = self._current_project_root
+        if isinstance(prepared_payload, tuple):
+            changed_values, changed_comments = prepared_payload
+        else:
+            payload = self._collect_update_payload()
+            if payload is not None:
+                changed_values, changed_comments = payload
+        # Для сценария копии сохраняем новые обозн./наимен. по ключу строки таблицы,
+        # чтобы применить их уже к документам в новой папке.
+        item_updates_by_key: Dict[Path, Dict[str, str]] = {}
+        for doc_path in self._assembly_items.keys():
+            mark_edit = self._assembly_item_new_marking.get(doc_path)
+            name_edit = self._assembly_item_new_name.get(doc_path)
+            new_mark = (mark_edit.text().strip() if mark_edit else "")
+            new_name = (name_edit.text().strip() if name_edit else "")
+            payload_meta: Dict[str, str] = {}
+            if new_mark:
+                payload_meta["marking"] = new_mark
+            if new_name:
+                payload_meta["name"] = new_name
+            if payload_meta:
+                item_updates_by_key[doc_path] = payload_meta
 
         target_text = self.copy_target_edit.text().strip()
         if not target_text:
@@ -1115,7 +1993,14 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            copy_result = copy_project_tree(self._current_project_root, target_parent)
+            folder_name = self.assembly_name_edit.text().strip()
+            if not folder_name and self._assembly_info:
+                folder_name = (self._assembly_info.name or "").strip()
+            copy_result = copy_project_tree(
+                self._current_project_root,
+                target_parent,
+                new_name=folder_name or None,
+            )
         finally:
             progress.close()
 
@@ -1135,11 +2020,54 @@ class MainWindow(QMainWindow):
             self._documents = documents
             self._var_index = var_index
             self._rebuild_variables_form()
+            self._sync_assembly_and_stamp_fields()
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка сканирования", f"Не удалось просканировать копию:\n{exc}")
             return
 
-        self._run_update_with_payload(changed_values, changed_comments)
+        if changed_values or changed_comments:
+            self._run_update_with_payload(changed_values, changed_comments)
+
+        # После пересчета переменных заново читаем проект и строим обозн./наимен.
+        self._on_rescan_clicked()
+        auto_filled = self._fill_item_metadata_by_rules()
+        auto_item_updates = self._collect_item_metadata_payload()
+
+        # Ручные значения, которые были заполнены до копирования, должны иметь приоритет.
+        item_updates_copy: Dict[Path, Dict[str, str]] = dict(auto_item_updates)
+        for src_doc_path, payload_meta in item_updates_by_key.items():
+            if source_root is None:
+                continue
+            try:
+                rel = src_doc_path.relative_to(source_root)
+            except ValueError:
+                continue
+            dst_doc_path = copied_path / rel
+            existed = item_updates_copy.get(dst_doc_path, {})
+            existed.update(payload_meta)
+            item_updates_copy[dst_doc_path] = existed
+
+        if item_updates_copy:
+            meta_result = self._apply_item_metadata_updates(item_updates_copy, sync_assembly_components=False)
+            if not meta_result.get("success"):
+                errors = meta_result.get("errors") or []
+                QMessageBox.warning(
+                    self,
+                    "Частичные ошибки",
+                    "Копия создана и переменные обновлены, но часть обозначений/наименований не записалась:\n"
+                    + "\n".join(str(e) for e in errors),
+                )
+
+        self._on_rescan_clicked()
+        QMessageBox.information(
+            self,
+            "Проект создан",
+            f"Копия проекта создана:\n{copied_path}\n\n"
+            f"Переменных к обновлению: {len(changed_values)}\n"
+            f"Комментариев чертежей: {len(changed_comments)}\n"
+            f"Обозн./наимен. к применению: {len(item_updates_copy)}\n"
+            f"Автоподстановка по правилам: обозн. {auto_filled['markings']}, наимен. {auto_filled['names']}",
+        )
 
     def _on_update_variables_clicked(self) -> None:
         """
@@ -1154,15 +2082,52 @@ class MainWindow(QMainWindow):
         if payload is None:
             return
         changed_values, changed_comments = payload
-        if not changed_values and not changed_comments:
-            QMessageBox.information(self, "Нет изменений", "Вы не изменили ни одной переменной.")
+        item_updates = self._collect_item_metadata_payload()
+
+        if not changed_values and not changed_comments and not item_updates:
+            QMessageBox.information(
+                self,
+                "Нет изменений",
+                "Не изменены ни переменные/комментарии, ни поля «Новое обозначение/наименование».",
+            )
             return
 
-        if self.copy_mode_check.isChecked():
-            self._on_copy_and_update_clicked((changed_values, changed_comments))
-            return
+        if changed_values or changed_comments:
+            self._run_update_with_payload(changed_values, changed_comments)
+            # Важно: читаем из Kompas уже пересчитанные формулами значения.
+            self._on_rescan_clicked()
+            self._fill_item_metadata_by_rules()
+            # Добавляем автоматические значения, но оставляем ручные как приоритет.
+            auto_updates = self._collect_item_metadata_payload()
+            for p, payload in auto_updates.items():
+                existed = item_updates.get(p, {})
+                merged = dict(payload)
+                merged.update(existed)
+                item_updates[p] = merged
 
-        self._run_update_with_payload(changed_values, changed_comments)
+        if item_updates:
+            meta_result = self._apply_item_metadata_updates(item_updates, sync_assembly_components=False)
+            time.sleep(0.8)
+            sync_result = self._run_isolated_assembly_sync(item_updates)
+            if not meta_result.get("success"):
+                errors = meta_result.get("errors") or []
+                QMessageBox.warning(
+                    self,
+                    "Частичные ошибки",
+                    "Переменные обновлены, но часть обозначений/наименований не записалась:\n"
+                    + "\n".join(str(e) for e in errors),
+                )
+            if not sync_result.get("success"):
+                errors = sync_result.get("errors") or []
+                QMessageBox.warning(
+                    self,
+                    "Частичные ошибки синхронизации",
+                    "Переменные обновлены, но синхронизация вхождений сборки завершилась с ошибками:\n"
+                    + "\n".join(str(e) for e in errors),
+                )
+
+        # После записи в документы обновляем эталонные значения в UI.
+        self._on_rescan_clicked()
 
     def _on_update_stamps_clicked(self) -> None:
         """Обновление штампов всех чертежей проекта."""
@@ -1170,42 +2135,49 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
             return
 
-        # Собираем значения полей; пустые строки означают "не изменять"
-        developer = self.stamp_developer_edit.text().strip() or None
-        checker = self.stamp_checker_edit.text().strip() or None
+        designation = self.stamp_designation_edit.text().strip() or None
+        name = self.stamp_name_edit.text().strip() or None
+
+        developer = self.stamp_developer_edit.currentText().strip() or None
+        checker = self.stamp_checker_edit.currentText().strip() or None
         organization = self.stamp_org_edit.text().strip() or None
-        # Формируем материал из толщины и типа, если заданы
         thickness_text = self.stamp_material_thickness_combo.currentText().strip()
         material_type = self.stamp_material_type_combo.currentText().strip()
         manual_material = self.stamp_material_edit.text().strip()
 
         material: str | None
         if manual_material:
-            # Если пользователь явно задал строку материала, используем её как есть
             material = manual_material
         elif thickness_text and material_type:
-            # Автоматическая строка: "Лист {t} ГОСТ 19903-2015/ {material_type}"
-            material = f"Лист {thickness_text} ГОСТ 19903-2015/ {material_type}"
+            # Формат как в образцовом проекте kompas3d_project_manager.
+            material = f"$d Лист {thickness_text},0х1250x2500 ГОСТ 19903-2015 ; {material_type} $"
             self.stamp_material_edit.setText(material)
+        elif material_type:
+            material = material_type
         else:
             material = None
 
-        tech_control = self.stamp_tech_ctrl_edit.text().strip() or None
-        norm_control = self.stamp_norm_ctrl_edit.text().strip() or None
-        approved = self.stamp_approved_edit.text().strip() or None
+        tech_control = self.stamp_tech_ctrl_edit.currentText().strip() or None
+        norm_control = self.stamp_norm_ctrl_edit.currentText().strip() or None
+        approved = self.stamp_approved_edit.currentText().strip() or None
         date = self.stamp_date_edit.text().strip() or None
-        order_number = self.stamp_order_edit.text().strip() or None
 
-        # Автоматическая дата: если есть хотя бы одна фамилия, а дата пустая — ставим текущую
+        sheet_mode: str = "none"
+        sheet_current: int | None = None
+        sheet_total: int | None = None
+        sc = self.stamp_sheet_current_spin.value()
+        st = self.stamp_sheet_total_spin.value()
+        if sc > 0 and st > 0:
+            sheet_mode = "manual"
+            sheet_current = sc
+            sheet_total = st
+
         if date is None and any([developer, checker, tech_control, norm_control, approved]):
             date = QDateTime.currentDateTime().date().toString("dd.MM.yyyy")
             self.stamp_date_edit.setText(date)
 
-        # Даты напротив каждой фамилии (ячейки могут зависеть от вашего шаблона штампа).
-        # Используем дефолтное соответствие 130–135, которое легко поменять позже.
         role_dates: Dict[int, str] = {}
         if date:
-            # 130: Разраб., 131: Пров., 132: Т. контр., 134: Н. контр., 135: Утв.
             if developer:
                 role_dates[130] = date
             if checker:
@@ -1217,8 +2189,21 @@ class MainWindow(QMainWindow):
             if approved:
                 role_dates[135] = date
 
+        has_sheet = sheet_mode in ("batch", "manual")
         if not any(
-            [developer, checker, organization, material, tech_control, norm_control, approved, date, order_number]
+            [
+                developer,
+                checker,
+                organization,
+                material,
+                tech_control,
+                norm_control,
+                approved,
+                date,
+                designation,
+                name,
+                has_sheet,
+            ]
         ):
             QMessageBox.information(self, "Нет данных", "Заполните хотя бы одно поле для обновления штампов.")
             return
@@ -1250,7 +2235,11 @@ class MainWindow(QMainWindow):
             approved=approved,
             date=date,
             role_dates=role_dates or None,
-            order_number=order_number,
+            designation=designation,
+            name=name,
+            sheet_mode=sheet_mode,
+            sheet_current=sheet_current,
+            sheet_total=sheet_total,
         )
 
         progress.close()
@@ -1260,6 +2249,8 @@ class MainWindow(QMainWindow):
                 type_="update_stamps",
                 status="success" if result.get("success") else "partial",
                 input_={
+                    "designation": designation,
+                    "name": name,
                     "developer": developer,
                     "checker": checker,
                     "organization": organization,
@@ -1268,7 +2259,9 @@ class MainWindow(QMainWindow):
                     "norm_control": norm_control,
                     "approved": approved,
                     "date": date,
-                    "order_number": order_number,
+                    "sheet_mode": sheet_mode,
+                    "sheet_current": sheet_current,
+                    "sheet_total": sheet_total,
                 },
                 changes={
                     "drawings_total": result.get("drawings_total", 0),
@@ -1295,6 +2288,53 @@ class MainWindow(QMainWindow):
                 self,
                 "Ошибки при обновлении штампов",
                 f"Во время обновления штампов возникли ошибки:\n{msg}",
+            )
+
+    def _on_auto_number_sheets_clicked(self) -> None:
+        """Отдельная операция автонумерации листов в выбранной папке."""
+        target_folder = self.stamp_sheet_folder_edit.text().strip()
+        root = Path(target_folder) if target_folder else self._current_project_root
+        if not root:
+            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта или папку чертежей.")
+            return
+        if not root.exists():
+            QMessageBox.warning(self, "Папка не найдена", f"Папка не существует:\n{root}")
+            return
+
+        progress = QProgressDialog(
+            "Автонумерация листов...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(True)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+
+        result = update_all_drawing_stamps(
+            self._kompas,
+            root,
+            sheet_mode="batch",
+        )
+        progress.close()
+
+        if result.get("success"):
+            QMessageBox.information(
+                self,
+                "Готово",
+                f"Листы пронумерованы.\n"
+                f"Чертежей обработано: {result.get('drawings_total', 0)}\n"
+                f"Обновлено: {result.get('drawings_updated', 0)}",
+            )
+        else:
+            errors = result.get("errors") or []
+            QMessageBox.critical(
+                self,
+                "Ошибки нумерации",
+                "Во время автонумерации возникли ошибки:\n" + "\n".join(str(e) for e in errors),
             )
 
     def _on_generate_qr_clicked(self) -> None:
