@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,28 @@ from typing import Dict
 
 
 logger = logging.getLogger("ProjectCopy")
+
+
+def _sanitize_folder_name(raw_name: str) -> str:
+    """Подготовить имя папки к ограничениям Windows."""
+    name = (raw_name or "").strip()
+    # Убираем запрещенные символы Windows и управляющие коды.
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name)
+    # Нормализуем пробелы и запрещенный завершающий суффикс.
+    name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
+    return name or "project_copy"
+
+
+def _pick_available_name(target_parent: Path, base_name: str) -> str:
+    """Вернуть свободное имя папки, добавляя суффикс _N при коллизии."""
+    if not (target_parent / base_name).exists():
+        return base_name
+    idx = 2
+    while True:
+        candidate = f"{base_name}_{idx}"
+        if not (target_parent / candidate).exists():
+            return candidate
+        idx += 1
 
 
 def _ignore_temp_files(_: str, names: list[str]) -> list[str]:
@@ -61,12 +84,12 @@ def copy_project_tree(source_root: Path, target_parent: Path, new_name: str | No
 
     if not new_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_name = f"{source_root.name}_copy_{stamp}"
+        base_name = f"{source_root.name}_copy_{stamp}"
+    else:
+        base_name = _sanitize_folder_name(new_name)
 
+    new_name = _pick_available_name(target_parent, base_name)
     target_root = target_parent / new_name
-    if target_root.exists():
-        result["error"] = f"Целевая папка уже существует: {target_root}"
-        return result
 
     logger.info("Копирование проекта: %s -> %s", source_root, target_root)
 

@@ -36,6 +36,8 @@ class KompasConnector:
         self.api7: Any | None = None
         self.application: Any | None = None
         self._connected: bool = False
+        # Флаг: активный документ уже был открыт в КОМПАС до нашего open_document().
+        self._active_doc_was_preopened: bool = False
 
     # ------------------------------------------------------------------
     # Подключение / отключение
@@ -151,7 +153,27 @@ class KompasConnector:
                 return False
 
             self.logger.info(f"Открытие документа: {path}")
-            doc = app7.Documents.Open(str(path), False)
+            # Если документ уже открыт в КОМПАС, переиспользуем его, а не открываем дубликат.
+            self._active_doc_was_preopened = False
+            doc = None
+            try:
+                docs = app7.Documents
+                for idx in range(docs.Count):
+                    d = docs.Item(idx)
+                    try:
+                        full_name = str(getattr(d, "FullName", "") or "").strip()
+                    except Exception:
+                        full_name = ""
+                    if full_name and Path(full_name).resolve() == path:
+                        doc = d
+                        self._active_doc_was_preopened = True
+                        break
+            except Exception:
+                # Если перечислить открытые документы не удалось, просто идём по стандартному пути.
+                pass
+
+            if doc is None:
+                doc = app7.Documents.Open(str(path), False)
             if not doc:
                 self.logger.error(f"Не удалось открыть документ: {path}")
                 return False
@@ -192,8 +214,23 @@ class KompasConnector:
                 return False
 
             name = getattr(active_doc, "Name", "<unknown>")
+            # Если документ был уже открыт пользователем до нашего вызова open_document(),
+            # не закрываем его насильно. При необходимости просто сохраняем.
+            if self._active_doc_was_preopened:
+                if save:
+                    try:
+                        active_doc.Save()
+                        self.logger.info(f"Документ сохранен (preopened): {name}")
+                    except Exception as exc:
+                        self.logger.warning(f"Не удалось сохранить preopened документ {name}: {exc}")
+                else:
+                    self.logger.info(f"Документ оставлен открытым (preopened): {name}")
+                self._active_doc_was_preopened = False
+                return True
+
             active_doc.Close(save)
             self.logger.info(f"Документ закрыт: {name} (save={save})")
+            self._active_doc_was_preopened = False
             return True
 
         except Exception as exc:  # pragma: no cover

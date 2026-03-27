@@ -22,6 +22,13 @@ from .models import KompasDocumentInfo, KompasVariable
 logger = logging.getLogger("VariablesScanner")
 
 
+def _normalize_block_id(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    normalized = raw.rstrip("_").strip()
+    return normalized or None
+
+
 def _is_instance_variable_name(name: str) -> bool:
     """
     Определить, является ли имя переменной переменной экземпляра (v1234_A3 и т.п.),
@@ -62,8 +69,9 @@ def _read_variables_from_assembly(conn: KompasConnector, asm_path: Path) -> Dict
     vars_dict: Dict[str, KompasVariable] = {}
     current_block: str | None = None
 
-    # Паттерн пустой переменной-блока: Stoiki________, Obolochka____ и т.п.
-    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9]+)_+$")
+    # Паттерн пустой переменной-блока: Stoiki________, Kronshtein_MacFox____ и т.п.
+    # Допускаем "_" внутри имени блока.
+    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9_]+)_+$")
 
     # Итерируем ограниченное количество переменных (как в оригинальном коде)
     for idx in range(200):
@@ -84,7 +92,7 @@ def _read_variables_from_assembly(conn: KompasConnector, asm_path: Path) -> Dict
             m = header_pattern.match(name)
             if m:
                 # Это пустая переменная-заголовок блока (Stoiki____, Kronshtein_MacFox____ и т.п.)
-                block_name = m.group(1)
+                block_name = _normalize_block_id(m.group(1)) or m.group(1)
                 current_block = block_name
                 kv = KompasVariable(
                     name=name,
@@ -99,7 +107,7 @@ def _read_variables_from_assembly(conn: KompasConnector, asm_path: Path) -> Dict
                     is_external=is_external,
                 )
             else:
-                block_id = current_block
+                block_id = _normalize_block_id(current_block)
                 # Специальное правило: все переменные, в имени которых есть "MacFox",
                 # попадают в блок Kronshtein_MacFox, даже если они физически в другом месте
                 if "macfox" in name.lower():
@@ -155,7 +163,7 @@ def _read_variables_from_part(conn: KompasConnector, part_path: Path) -> Dict[st
 
     vars_dict: Dict[str, KompasVariable] = {}
     current_block: str | None = None
-    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9]+)_+$")
+    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9_]+)_+$")
 
     for idx in range(200):
         try:
@@ -174,7 +182,7 @@ def _read_variables_from_part(conn: KompasConnector, part_path: Path) -> Dict[st
 
             m = header_pattern.match(name)
             if m:
-                block_name = m.group(1)
+                block_name = _normalize_block_id(m.group(1)) or m.group(1)
                 current_block = block_name
                 kv = KompasVariable(
                     name=name,
@@ -189,7 +197,7 @@ def _read_variables_from_part(conn: KompasConnector, part_path: Path) -> Dict[st
                     is_external=is_external,
                 )
             else:
-                block_id = current_block
+                block_id = _normalize_block_id(current_block)
                 if "macfox" in name.lower():
                     block_id = "Kronshtein_MacFox"
                 kv = KompasVariable(
@@ -238,8 +246,13 @@ def _read_marking_and_name(conn: KompasConnector, path: Path) -> Tuple[str | Non
             logger.error("ActiveDocument3D не найден при чтении обозначения/имени")
         else:
             i_part = i_doc3d.GetPart(-1)
+            # В рабочем образце используется lower-case; PascalCase оставляем как fallback.
             marking = getattr(i_part, "marking", None)
+            if marking in (None, ""):
+                marking = getattr(i_part, "Marking", None)
             name = getattr(i_part, "name", None)
+            if name in (None, ""):
+                name = getattr(i_part, "Name", None)
     except Exception as exc:  # pragma: no cover
         logger.error(f"Ошибка чтения обозначения/имени для {path}: {exc}")
     finally:
@@ -265,7 +278,7 @@ def _read_variables_from_drawing(conn: KompasConnector, drw_path: Path) -> Dict[
 
     vars_dict: Dict[str, KompasVariable] = {}
     current_block: str | None = None
-    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9]+)_+$")
+    header_pattern = re.compile(r"^([A-Za-zА-Яа-я0-9_]+)_+$")
 
     try:
         i_doc2d = getattr(api5, "ActiveDocument2D", None)
@@ -295,7 +308,7 @@ def _read_variables_from_drawing(conn: KompasConnector, drw_path: Path) -> Dict[
 
                 m = header_pattern.match(name)
                 if m:
-                    block_name = m.group(1)
+                    block_name = _normalize_block_id(m.group(1)) or m.group(1)
                     current_block = block_name
                     kv = KompasVariable(
                         name=name,
@@ -318,7 +331,7 @@ def _read_variables_from_drawing(conn: KompasConnector, drw_path: Path) -> Dict[
                         document_path=drw_path,
                         comment=comment,
                         expression=expression,
-                        block_id=current_block,
+                        block_id=_normalize_block_id(current_block),
                         is_block_header=False,
                         is_external=is_external,
                     )

@@ -9,17 +9,56 @@ from __future__ import annotations
 - для каждого чертежа открыть документ через API7, найти первый лист и его штамп;
 - обновить только те поля, значения для которых заданы (не пустые);
 - сохранить чертёж.
+
+Номера ячеек для ГОСТ 2.104 — см. модуль stamp_cells.
 """
 
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, List, Literal
 
+from . import stamp_cells as SC
 from .kompas_connector import KompasConnector
 
 
 logger = logging.getLogger("StampUpdater")
+
+SheetMode = Literal["none", "manual", "batch"]
+
+
+def collect_drawings_for_stamps(project_root: Path) -> List[Path]:
+    """
+    Список чертежей для обработки (без развёрток, без временных ~$).
+    """
+    project_root = Path(project_root).resolve()
+    all_drawings = list(project_root.glob("*.cdw"))
+    if not all_drawings:
+        all_drawings = list(project_root.rglob("*.cdw"))
+        all_drawings = [d for d in all_drawings if not d.name.startswith("~$")]
+
+    out: List[Path] = []
+    for drawing in all_drawings:
+        name_lower = drawing.name.lower()
+        if "развертка" in name_lower or "razvertka" in name_lower:
+            continue
+        out.append(drawing)
+    return out
+
+
+def sort_drawings_for_sheet_numbering(drawings: List[Path]) -> List[Path]:
+    """
+    Сортировка: сначала по номеру из «(лист N)» в имени файла, иначе по имени.
+    """
+
+    def sort_key(p: Path) -> tuple:
+        m = re.search(r"\(лист\s*(\d+)\)", p.name, re.IGNORECASE)
+        if m:
+            return (0, int(m.group(1)), p.name.lower())
+        return (1, p.name.lower())
+
+    return sorted(drawings, key=sort_key)
 
 
 def update_all_drawing_stamps(
@@ -35,21 +74,20 @@ def update_all_drawing_stamps(
     approved: str | None = None,
     date: str | None = None,
     role_dates: Dict[int, str] | None = None,
-    order_number: str | None = None,
+    designation: str | None = None,
+    name: str | None = None,
+    sheet_mode: SheetMode = "none",
+    sheet_current: int | None = None,
+    sheet_total: int | None = None,
 ) -> Dict[str, Any]:
     """
     Обновить штампы всех чертежей в указанной папке проекта.
 
-    Поля соответствуют типовым ячейкам КОМПАС:
-      - developer: 110
-      - checker: 111
-      - tech_control: 112
-      - norm_control: 114
-      - approved: 115
-      - organization: 9
-      - material: 3 (для несборочных чертежей)
-      - date: 130 (общая дата разработки, если не передан role_dates)
-      - role_dates: словарь {ячейка_даты: строка_даты} для проставления дат напротив ролей
+    Поля соответствуют ячейкам КОМПАС (см. stamp_cells):
+      - designation, name — основная надпись;
+      - sheet_mode batch: нумерация листов 1…N по списку sort_drawings_for_sheet_numbering;
+      - sheet_mode manual: одинаковые sheet_current / sheet_total для всех чертежей;
+      - developer: 110, checker: 111, …
     """
     result: Dict[str, Any] = {
         "success": False,
@@ -72,35 +110,23 @@ def update_all_drawing_stamps(
     logger.info("=" * 60)
     logger.info(f"Папка проекта: {project_root}")
 
-    # Поиск чертежей: сначала в корне, затем при необходимости рекурсивно
-    all_drawings = list(project_root.glob("*.cdw"))
-    if not all_drawings:
-        logger.info("Чертежи в корне не найдены, пробуем рекурсивный поиск...")
-        all_drawings = list(project_root.rglob("*.cdw"))
-        all_drawings = [d for d in all_drawings if not d.name.startswith("~$")]
-
-    # Исключаем развертки
-    drawings_to_process: list[Path] = []
-    unfoldings_skipped = 0
-    for drawing in all_drawings:
-        name_lower = drawing.name.lower()
-        if "развертка" in name_lower or "razvertka" in name_lower:
-            unfoldings_skipped += 1
-            continue
-        drawings_to_process.append(drawing)
-
-    all_drawings = drawings_to_process
+    all_drawings = collect_drawings_for_stamps(project_root)
     result["drawings_total"] = len(all_drawings)
 
-    if unfoldings_skipped:
-        logger.info(f"Пропущено разверток: {unfoldings_skipped}")
-
-    logger.info(f"Найдено чертежей для обработки: {len(all_drawings)}")
     if not all_drawings:
         msg = "Чертежи для обновления штампов не найдены."
         logger.warning(msg)
         result["errors"].append(msg)
         return result
+
+    sorted_for_sheets = sort_drawings_for_sheet_numbering(all_drawings)
+    sheet_index_map: Dict[Path, tuple[int, int]] = {}
+    if sheet_mode == "batch" and sorted_for_sheets:
+        total = len(sorted_for_sheets)
+        for i, p in enumerate(sorted_for_sheets, start=1):
+            sheet_index_map[p.resolve()] = (i, total)
+
+    logger.info(f"Найдено чертежей для обработки: {len(all_drawings)}")
 
     api7 = conn.get_api7()
     if api7 is None:
@@ -138,7 +164,16 @@ def update_all_drawing_stamps(
                     pass
                 continue
 
-            # Если ни одно поле не задано — просто пересобираем/сохраняем чертёж
+            cur_sheet: int | None = None
+            tot_sheet: int | None = None
+            if sheet_mode == "batch":
+                pair = sheet_index_map.get(drawing.resolve())
+                if pair:
+                    cur_sheet, tot_sheet = pair
+            elif sheet_mode == "manual":
+                cur_sheet = sheet_current
+                tot_sheet = sheet_total
+
             any_field = any(
                 [
                     developer,
@@ -150,6 +185,9 @@ def update_all_drawing_stamps(
                     approved,
                     date,
                     bool(role_dates),
+                    designation,
+                    name,
+                    cur_sheet is not None and tot_sheet is not None,
                 ]
             )
             fields_updated = 0
@@ -167,30 +205,36 @@ def update_all_drawing_stamps(
                         if stamp:
                             fields_to_update: dict[int, str] = {}
 
-                            if developer:
-                                fields_to_update[110] = developer
-                            if checker:
-                                fields_to_update[111] = checker
-                            if tech_control:
-                                fields_to_update[112] = tech_control
-                            if norm_control:
-                                fields_to_update[114] = norm_control
-                            if approved:
-                                fields_to_update[115] = approved
-                            if organization:
-                                fields_to_update[9] = organization
+                            if designation:
+                                fields_to_update[SC.DESIGNATION] = designation
+                            if name:
+                                fields_to_update[SC.NAME] = name
+                            if cur_sheet is not None and tot_sheet is not None:
+                                fields_to_update[SC.SHEET_CURRENT] = str(cur_sheet)
+                                fields_to_update[SC.SHEET_TOTAL] = str(tot_sheet)
 
-                            # Материал не заполняем для сборочных чертежей (СБ)
+                            if developer:
+                                fields_to_update[SC.DEVELOPER] = developer
+                            if checker:
+                                fields_to_update[SC.CHECKER] = checker
+                            if tech_control:
+                                fields_to_update[SC.TECH_CONTROL] = tech_control
+                            if norm_control:
+                                fields_to_update[SC.NORM_CONTROL] = norm_control
+                            if approved:
+                                fields_to_update[SC.APPROVED] = approved
+                            if organization:
+                                fields_to_update[SC.ORGANIZATION] = organization
+
                             is_assembly = "сб" in drawing.name.lower() or "sb" in drawing.name.lower()
                             if material and not is_assembly:
-                                fields_to_update[3] = material
+                                fields_to_update[SC.MATERIAL] = material
                             elif material and is_assembly:
                                 logger.info("  Материал пропущен (сборочный чертеж)")
 
                             if date:
-                                fields_to_update[130] = date
+                                fields_to_update[SC.DATE_MAIN] = date
                             if role_dates:
-                                # Явные даты по ячейкам имеют приоритет (могут дополнять общую дату)
                                 for cell_id, value in role_dates.items():
                                     if value:
                                         fields_to_update[int(cell_id)] = str(value)
@@ -214,7 +258,6 @@ def update_all_drawing_stamps(
                         else:
                             logger.warning("  Штамп не найден")
 
-            # Сохраняем и закрываем документ
             try:
                 kompas_document_2d = api7.ActiveDocument
                 if kompas_document_2d:
@@ -250,4 +293,3 @@ def update_all_drawing_stamps(
 
     result["success"] = len(result["errors"]) == 0
     return result
-
