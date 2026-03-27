@@ -59,6 +59,8 @@ from ..core.variables_updater import update_project_variables
 from ..core.log_store import JsonLogStore
 from ..core.models import KompasDocumentInfo, KompasVariable
 from ..core.stamp_updater import update_all_drawing_stamps
+from ..core.drawing_pdf_exporter import DrawingPdfExporter
+from ..core.drawing_dwg_exporter import DrawingDwgExporter
 from ..core.project_copy import copy_project_tree
 from ..core.profile_rules import (
     build_element_designation,
@@ -416,6 +418,87 @@ class MainWindow(QMainWindow):
         stamp_layout.addStretch(1)
 
         left_tabs.addTab(self.stamp_tab, "Штампы")
+
+        # Вкладка "Экспорт PDF"
+        self.pdf_tab = QWidget()
+        pdf_layout = QVBoxLayout(self.pdf_tab)
+
+        pdf_group = QGroupBox("Экспорт CDW -> PDF")
+        pdf_group_layout = QFormLayout(pdf_group)
+        pdf_group_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        pdf_source_row = QHBoxLayout()
+        self.pdf_source_folder_edit = QLineEdit()
+        self.pdf_source_folder_edit.setPlaceholderText("Папка с чертежами .cdw (по умолчанию: папка проекта)")
+        self.btn_pdf_source_folder_browse = QPushButton("Папка чертежей...")
+        self.btn_pdf_source_folder_browse.clicked.connect(self._browse_pdf_source_folder)
+        pdf_source_row.addWidget(self.pdf_source_folder_edit, stretch=1)
+        pdf_source_row.addWidget(self.btn_pdf_source_folder_browse)
+
+        pdf_output_row = QHBoxLayout()
+        self.pdf_export_folder_edit = QLineEdit()
+        self.pdf_export_folder_edit.setPlaceholderText("Папка для PDF (по умолчанию: <папка чертежей>/PDF)")
+        self.btn_pdf_export_folder_browse = QPushButton("Папка PDF...")
+        self.btn_pdf_export_folder_browse.clicked.connect(self._browse_pdf_export_folder)
+        pdf_output_row.addWidget(self.pdf_export_folder_edit, stretch=1)
+        pdf_output_row.addWidget(self.btn_pdf_export_folder_browse)
+
+        self.pdf_merge_check = QCheckBox("Объединить все PDF в один файл")
+        self.pdf_merge_check.setChecked(True)
+        self.pdf_merged_name_edit = QLineEdit()
+        self.pdf_merged_name_edit.setPlaceholderText("Имя объединенного PDF (необязательно)")
+
+        pdf_export_btn_row = QHBoxLayout()
+        self.btn_export_drawings_pdf = QPushButton("Экспорт CDW -> PDF")
+        self.btn_export_drawings_pdf.clicked.connect(self._on_export_drawings_pdf_clicked)
+        pdf_export_btn_row.addStretch(1)
+        pdf_export_btn_row.addWidget(self.btn_export_drawings_pdf)
+
+        pdf_group_layout.addRow("Папка чертежей:", pdf_source_row)
+        pdf_group_layout.addRow("Папка вывода:", pdf_output_row)
+        pdf_group_layout.addRow("", self.pdf_merge_check)
+        pdf_group_layout.addRow("Объединенный файл:", self.pdf_merged_name_edit)
+        pdf_group_layout.addRow("", pdf_export_btn_row)
+        pdf_layout.addWidget(pdf_group)
+        pdf_layout.addStretch(1)
+        left_tabs.addTab(self.pdf_tab, "Экспорт PDF")
+
+        # Вкладка "Экспорт DWG"
+        self.dwg_tab = QWidget()
+        dwg_layout = QVBoxLayout(self.dwg_tab)
+
+        dwg_group = QGroupBox("Экспорт CDW -> DWG")
+        dwg_group_layout = QFormLayout(dwg_group)
+        dwg_group_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        dwg_source_row = QHBoxLayout()
+        self.dwg_source_folder_edit = QLineEdit()
+        self.dwg_source_folder_edit.setPlaceholderText("Папка с чертежами .cdw (по умолчанию: папка проекта)")
+        self.btn_dwg_source_folder_browse = QPushButton("Папка чертежей...")
+        self.btn_dwg_source_folder_browse.clicked.connect(self._browse_dwg_source_folder)
+        dwg_source_row.addWidget(self.dwg_source_folder_edit, stretch=1)
+        dwg_source_row.addWidget(self.btn_dwg_source_folder_browse)
+
+        dwg_output_row = QHBoxLayout()
+        self.dwg_export_folder_edit = QLineEdit()
+        self.dwg_export_folder_edit.setPlaceholderText("Папка для DWG (по умолчанию: <папка чертежей>/DWG)")
+        self.btn_dwg_export_folder_browse = QPushButton("Папка DWG...")
+        self.btn_dwg_export_folder_browse.clicked.connect(self._browse_dwg_export_folder)
+        dwg_output_row.addWidget(self.dwg_export_folder_edit, stretch=1)
+        dwg_output_row.addWidget(self.btn_dwg_export_folder_browse)
+
+        dwg_export_btn_row = QHBoxLayout()
+        self.btn_export_drawings_dwg = QPushButton("Экспорт CDW -> DWG")
+        self.btn_export_drawings_dwg.clicked.connect(self._on_export_drawings_dwg_clicked)
+        dwg_export_btn_row.addStretch(1)
+        dwg_export_btn_row.addWidget(self.btn_export_drawings_dwg)
+
+        dwg_group_layout.addRow("Папка чертежей:", dwg_source_row)
+        dwg_group_layout.addRow("Папка вывода:", dwg_output_row)
+        dwg_group_layout.addRow("", dwg_export_btn_row)
+        dwg_layout.addWidget(dwg_group)
+        dwg_layout.addStretch(1)
+        left_tabs.addTab(self.dwg_tab, "Экспорт DWG")
 
         # Вкладка "QR-коды"
         self.qr_tab = QWidget()
@@ -1770,6 +1853,50 @@ class MainWindow(QMainWindow):
             return
         self.stamp_sheet_folder_edit.setText(folder)
 
+    def _browse_pdf_export_folder(self) -> None:
+        """Выбрать папку для экспорта PDF."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку для PDF",
+            str(self._current_project_root or ""),
+        )
+        if not folder:
+            return
+        self.pdf_export_folder_edit.setText(folder)
+
+    def _browse_pdf_source_folder(self) -> None:
+        """Выбрать папку с чертежами для PDF-экспорта."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку с чертежами (.cdw) для PDF",
+            str(self._current_project_root or ""),
+        )
+        if not folder:
+            return
+        self.pdf_source_folder_edit.setText(folder)
+
+    def _browse_dwg_source_folder(self) -> None:
+        """Выбрать папку с чертежами для DWG-экспорта."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку с чертежами (.cdw) для DWG",
+            str(self._current_project_root or ""),
+        )
+        if not folder:
+            return
+        self.dwg_source_folder_edit.setText(folder)
+
+    def _browse_dwg_export_folder(self) -> None:
+        """Выбрать папку для экспорта DWG."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку для DWG",
+            str(self._current_project_root or ""),
+        )
+        if not folder:
+            return
+        self.dwg_export_folder_edit.setText(folder)
+
     def _copy_log_to_clipboard(self) -> None:
         """Скопировать весь текст лога в буфер обмена."""
         text = self.log_view.toPlainText()
@@ -2288,6 +2415,162 @@ class MainWindow(QMainWindow):
                 self,
                 "Ошибки при обновлении штампов",
                 f"Во время обновления штампов возникли ошибки:\n{msg}",
+            )
+
+    def _on_export_drawings_pdf_clicked(self) -> None:
+        """Экспорт всех CDW чертежей в PDF через локальный сервис."""
+        if not self._current_project_root:
+            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
+            return
+
+        source_folder_text = self.pdf_source_folder_edit.text().strip()
+        source_root = Path(source_folder_text) if source_folder_text else self._current_project_root
+        if not source_root.exists():
+            QMessageBox.warning(self, "Папка не найдена", f"Папка с чертежами не существует:\n{source_root}")
+            return
+
+        output_folder_text = self.pdf_export_folder_edit.text().strip()
+        output_folder = Path(output_folder_text) if output_folder_text else (source_root / "PDF")
+        merge_into_one = self.pdf_merge_check.isChecked()
+        merged_name = self.pdf_merged_name_edit.text().strip() or None
+
+        logger.info("Запуск экспорта CDW в PDF через локальный сервис...")
+
+        progress = QProgressDialog(
+            "Экспорт CDW в PDF...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(True)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+
+        exporter = DrawingPdfExporter()
+        result = exporter.export_all_drawings_to_pdf(
+            project_root=source_root,
+            output_folder=output_folder,
+            merge_into_one=merge_into_one,
+            merged_output_name=merged_name,
+        )
+        progress.close()
+
+        if self._json_log:
+            self._json_log.add_action(
+                type_="export_pdf",
+                status="success" if result.get("success") else "partial",
+                input_={
+                    "source_folder": str(source_root),
+                    "output_folder": str(output_folder),
+                    "merge_into_one": merge_into_one,
+                    "merged_name": merged_name,
+                },
+                changes={
+                    "drawings_total": result.get("total_drawings", 0),
+                    "exported_pdfs": result.get("exported_pdfs", 0),
+                    "merged_pdf": result.get("merged_pdf"),
+                },
+                meta={"errors": result.get("errors", [])},
+            )
+
+        if result.get("success"):
+            info_lines = [
+                f"Чертежей обработано: {result.get('total_drawings', 0)}",
+                f"Экспортировано PDF: {result.get('exported_pdfs', 0)}",
+                f"Ошибок: {result.get('failed_drawings', 0)}",
+            ]
+            merged_pdf = result.get("merged_pdf")
+            if merged_pdf:
+                info_lines.append(f"Объединенный PDF:\n{merged_pdf}")
+
+            self.statusBar().showMessage(
+                f"Экспорт PDF завершен: {result.get('exported_pdfs', 0)} из {result.get('total_drawings', 0)}",
+                5000,
+            )
+            QMessageBox.information(self, "Экспорт PDF завершен", "\n".join(info_lines))
+        else:
+            errors = result.get("errors") or []
+            msg = "\n".join(str(e) for e in errors) or "Неизвестная ошибка"
+            QMessageBox.critical(
+                self,
+                "Ошибки при экспорте PDF",
+                f"Во время экспорта PDF возникли ошибки:\n{msg}",
+            )
+
+    def _on_export_drawings_dwg_clicked(self) -> None:
+        """Прямой экспорт всех CDW чертежей в DWG через локальный сервис."""
+        if not self._current_project_root:
+            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
+            return
+
+        source_folder_text = self.dwg_source_folder_edit.text().strip()
+        source_root = Path(source_folder_text) if source_folder_text else self._current_project_root
+        if not source_root.exists():
+            QMessageBox.warning(self, "Папка не найдена", f"Папка с чертежами не существует:\n{source_root}")
+            return
+
+        output_folder_text = self.dwg_export_folder_edit.text().strip()
+        output_folder = Path(output_folder_text) if output_folder_text else (source_root / "DWG")
+
+        logger.info("Запуск прямого экспорта CDW в DWG через локальный сервис...")
+
+        progress = QProgressDialog(
+            "Экспорт CDW в DWG...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(True)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+
+        exporter = DrawingDwgExporter()
+        result = exporter.export_all_drawings_to_dwg(
+            project_root=source_root,
+            output_folder=output_folder,
+        )
+        progress.close()
+
+        if self._json_log:
+            self._json_log.add_action(
+                type_="export_dwg",
+                status="success" if result.get("success") else "partial",
+                input_={
+                    "source_folder": str(source_root),
+                    "output_folder": str(output_folder),
+                },
+                changes={
+                    "drawings_total": result.get("total_drawings", 0),
+                    "exported_dwgs": result.get("exported_dwgs", 0),
+                },
+                meta={"errors": result.get("errors", [])},
+            )
+
+        if result.get("success"):
+            info_lines = [
+                f"Чертежей обработано: {result.get('total_drawings', 0)}",
+                f"Экспортировано DWG: {result.get('exported_dwgs', 0)}",
+                f"Ошибок: {result.get('failed_drawings', 0)}",
+                f"Папка вывода:\n{output_folder}",
+            ]
+            self.statusBar().showMessage(
+                f"Экспорт DWG завершен: {result.get('exported_dwgs', 0)} из {result.get('total_drawings', 0)}",
+                5000,
+            )
+            QMessageBox.information(self, "Экспорт DWG завершен", "\n".join(info_lines))
+        else:
+            errors = result.get("errors") or []
+            msg = "\n".join(str(e) for e in errors) or "Неизвестная ошибка"
+            QMessageBox.critical(
+                self,
+                "Ошибки при экспорте DWG",
+                f"Во время экспорта DWG возникли ошибки:\n{msg}",
             )
 
     def _on_auto_number_sheets_clicked(self) -> None:
