@@ -16,14 +16,20 @@ logger = logging.getLogger("DrawingDwgExporter")
 
 
 class DrawingDwgExporter:
-    def __init__(self, base_url: str = "http://127.0.0.1:5000") -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:5001") -> None:
         self.base_url = base_url.rstrip("/")
 
     def ensure_service_running(self, timeout_sec: int = 15) -> bool:
         health_url = f"{self.base_url}/health"
         try:
-            requests.get(health_url, timeout=1)
-            return True
+            resp = requests.get(health_url, timeout=1)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                if data.get("service") == "kompas-pdf":
+                    return True
         except Exception:
             pass
 
@@ -60,7 +66,7 @@ class DrawingDwgExporter:
             response = requests.post(
                 f"{self.base_url}/export_dwg",
                 json=payload,
-                timeout=240,
+                timeout=90,
             )
         except Exception as exc:
             return {"success": False, "error": f"Service request failed: {exc}"}

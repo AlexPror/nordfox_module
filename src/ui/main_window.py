@@ -2485,6 +2485,21 @@ class MainWindow(QMainWindow):
             merged_pdf = result.get("merged_pdf")
             if merged_pdf:
                 info_lines.append(f"Объединенный PDF:\n{merged_pdf}")
+            elif merge_into_one:
+                # Экспорт может пройти успешно, но объединение не выполниться.
+                # Показываем причину прямо в success-окне, чтобы это было видно пользователю.
+                merge_errors = [
+                    str(e)
+                    for e in (result.get("errors") or [])
+                    if str(e).startswith("PDF merge error")
+                    or str(e).startswith("No readable PDF files to merge")
+                    or str(e).startswith("No valid PDF files to merge")
+                    or str(e).startswith("pypdf is not installed")
+                    or str(e).startswith("Merge skip:")
+                ]
+                if merge_errors:
+                    info_lines.append("Объединение PDF не выполнено:")
+                    info_lines.extend(merge_errors[:8])
 
             self.statusBar().showMessage(
                 f"Экспорт PDF завершен: {result.get('exported_pdfs', 0)} из {result.get('total_drawings', 0)}",
