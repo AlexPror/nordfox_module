@@ -22,16 +22,17 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QDateTime
-from PyQt6.QtGui import QAction, QFont
+from PyQt6.QtGui import QAction, QFont, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
     QFileDialog,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QGroupBox,
     QLabel,
     QLineEdit,
@@ -49,6 +50,8 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QCheckBox,
     QSpinBox,
+    QDoubleSpinBox,
+    QStyle,
 )
 from PyQt6.QtWidgets import QApplication, QProgressDialog
 
@@ -58,7 +61,25 @@ from ..core.variables_scanner import scan_project
 from ..core.variables_updater import update_project_variables
 from ..core.log_store import JsonLogStore
 from ..core.models import KompasDocumentInfo, KompasVariable
-from ..core.stamp_updater import update_all_drawing_stamps
+from ..core import stamp_cells as STAMP_CELLS
+from ..core.drawing_packager import (
+    append_material_to_register_line,
+    apply_renames_two_phase,
+    build_new_filename,
+    format_register_name_from_middle,
+    parse_cdw_stem,
+    plan_renames_for_order,
+)
+from ..core.stamp_updater import (
+    collect_drawings_for_stamps,
+    is_drawing_node_sheet,
+    is_drawing_title_sheet,
+    read_stamp_cell_str,
+    scan_stamp_cells_non_empty,
+    sort_drawings_for_sheet_numbering,
+    update_all_drawing_stamps,
+)
+from ..core.drawing_list_frw import HEADER as FRW_REGISTER_HEADER, export_register_frw
 from ..core.drawing_pdf_exporter import DrawingPdfExporter
 from ..core.drawing_dwg_exporter import DrawingDwgExporter
 from ..core.project_copy import copy_project_tree
@@ -123,6 +144,7 @@ class MainWindow(QMainWindow):
 
         self._kompas = KompasConnector()
         self._json_log: Optional[JsonLogStore] = None
+        self._qt_log_handler: Optional[QtTextLogHandler] = None
         self._updating_in_progress: bool = False
 
         self._setup_ui()
@@ -145,23 +167,31 @@ class MainWindow(QMainWindow):
         # Блок выбора проекта и данных сборки
         top_group = QGroupBox("Проект NordFox")
         top_layout = QVBoxLayout(top_group)
+        top_layout.setContentsMargins(8, 8, 8, 8)
+        top_layout.setSpacing(6)
 
         # Строка выбора папки проекта
-        project_row = QHBoxLayout()
-        lbl_project = QLabel("Папка проекта:")
+        project_grid = QGridLayout()
+        project_grid.setColumnStretch(1, 1)
+        project_grid.setHorizontalSpacing(8)
+        project_grid.addWidget(
+            QLabel("Папка проекта:"),
+            0,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
         self.project_path_edit = QLineEdit()
         self.project_path_edit.setPlaceholderText("Выберите папку с КОМПАС-проектом (сборка модулей NordFox)...")
         self.project_path_edit.setReadOnly(True)
-        btn_browse = QPushButton("Открыть...")
-        btn_browse.clicked.connect(self._browse_project_folder)
-
-        project_row.addWidget(lbl_project)
-        project_row.addWidget(self.project_path_edit)
-        project_row.addWidget(btn_browse)
-        top_layout.addLayout(project_row)
+        self.btn_open_project = QPushButton("Открыть...")
+        self.btn_open_project.clicked.connect(self._browse_project_folder)
+        project_grid.addWidget(self.project_path_edit, 0, 1)
+        project_grid.addWidget(self.btn_open_project, 0, 2)
+        top_layout.addLayout(project_grid)
 
         # Строка режима "копия + обновление"
         copy_row = QHBoxLayout()
+        copy_row.setSpacing(8)
         self.copy_mode_check = QCheckBox("Работать с копией проекта")
         self.copy_mode_check.setChecked(False)
         self.copy_mode_check.setVisible(False)
@@ -193,6 +223,7 @@ class MainWindow(QMainWindow):
         self.assembly_designation_edit.setPlaceholderText("Обозначение сборки (будет прочитано из КОМПАС)...")
         self.assembly_name_edit.setPlaceholderText("Наименование сборки (будет прочитано из КОМПАС)...")
 
+        assembly_row.setSpacing(8)
         lbl_assm_des = QLabel("Обозначение сборки:")
         lbl_assm_name = QLabel("Наименование сборки:")
         assembly_row.addWidget(lbl_assm_des)
@@ -211,7 +242,9 @@ class MainWindow(QMainWindow):
         left_tabs = QTabWidget()
         left_tabs.setTabPosition(QTabWidget.TabPosition.North)
         left_tabs.setDocumentMode(True)
-        left_tabs.setStyleSheet("QTabBar::tab { height: 28px; }")
+        left_tabs.setStyleSheet(
+            "QTabBar::tab { height: 28px; min-width: 88px; padding: 4px 10px 4px 8px; }"
+        )
 
         # Вкладка "Переменные" (форма будет наполняться после сканирования)
         self.vars_tab = QWidget()
@@ -243,7 +276,11 @@ class MainWindow(QMainWindow):
 
         vars_layout.addLayout(buttons_row)
 
-        left_tabs.addTab(self.vars_tab, "Переменные")
+        left_tabs.addTab(
+            self.vars_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "Переменные",
+        )
 
         # Вкладка "Детали/подсборки" (таблица обозначений/наименований)
         self.items_tab = QWidget()
@@ -301,7 +338,11 @@ class MainWindow(QMainWindow):
         items_layout.addWidget(self.items_table)
         items_layout.addStretch(1)
 
-        left_tabs.addTab(self.items_tab, "Обозн./наимен.")
+        left_tabs.addTab(
+            self.items_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "Обозн./наимен.",
+        )
 
         # Вкладка "Штампы"
         self.stamp_tab = QWidget()
@@ -312,8 +353,8 @@ class MainWindow(QMainWindow):
 
         self.stamp_designation_edit = QLineEdit()
         self.stamp_name_edit = QLineEdit()
-        self.stamp_designation_edit.setPlaceholderText("Обозначение (ячейка 2, см. stamp_cells.py)")
-        self.stamp_name_edit.setPlaceholderText("Наименование (ячейка 1)")
+        self.stamp_designation_edit.setPlaceholderText("Обозначение (ячейка 2)")
+        self.stamp_name_edit.setPlaceholderText("Наименование (ячейка 3)")
 
         self.stamp_sheet_auto_check = QCheckBox("Нумеровать листы автоматически (1…N, порядок — см. справку)")
         self.stamp_sheet_auto_check.setChecked(False)
@@ -357,15 +398,19 @@ class MainWindow(QMainWindow):
             "Ст3. ГОСТ 19281-2014",
         ])
         self.stamp_material_edit.setPlaceholderText(
-            "Материал (ячейка 3). Можно ввести вручную или выбрать тип выше."
+            "Материал / тип (ячейка 1). Можно ввести вручную или выбрать тип выше."
         )
         self.stamp_tech_ctrl_edit.setPlaceholderText("Т. контр. (ячейка 112)")
         self.stamp_norm_ctrl_edit.setPlaceholderText("Н. контр. (ячейка 114)")
         self.stamp_approved_edit.setPlaceholderText("Утв. (ячейка 115)")
         self.stamp_date_edit.setPlaceholderText("Дата (ячейка 130, формат 01.01.2026)")
 
+        self.stamp_litera_edit = QLineEdit()
+        self.stamp_litera_edit.setPlaceholderText("Литера (ячейка 41 в вашем штампе)")
+
         stamp_form.addRow("Обозначение:", self.stamp_designation_edit)
         stamp_form.addRow("Наименование:", self.stamp_name_edit)
+        stamp_form.addRow("Литера:", self.stamp_litera_edit)
         stamp_form.addRow("", self.stamp_sheet_auto_check)
         stamp_form.addRow("Листы:", sheet_row)
         stamp_form.addRow("Разработал:", self.stamp_developer_edit)
@@ -387,8 +432,9 @@ class MainWindow(QMainWindow):
         stamp_layout.addLayout(stamp_form)
 
         hint_stamp = QLabel(
-            "Номера ячеек штампа ГОСТ 2.104 заданы в src/core/stamp_cells.py. "
-            "Для материала используется формат КОМПАС: $d ... ; ... $."
+            "Номера ячеек по умолчанию — в src/core/stamp_cells.py. "
+            "Блок ниже «Узнать номера ячеек штампа» читает заполненный в КОМПАС штамп и показывает индексы. "
+            "Материал в КОМПАС: $d ... ; ... $."
         )
         hint_stamp.setWordWrap(True)
         hint_stamp.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -407,6 +453,25 @@ class MainWindow(QMainWindow):
         sheet_auto_layout.addWidget(self.btn_auto_number_sheets)
         stamp_layout.addWidget(sheet_auto_group)
 
+        stamp_scan_group = QGroupBox("Узнать номера ячеек штампа")
+        stamp_scan_layout = QVBoxLayout(stamp_scan_group)
+        stamp_scan_intro = QLabel(
+            "Укажите папку с чертежами выше (или откройте папку проекта). "
+            "В КОМПАС заполните штамп в одном чертеже и сохраните файл. "
+            "Нажмите кнопку — выберите этот .cdw; папка в диалоге откроется из указанного пути. "
+            "Файл только читается. Список «номер ячейки: текст» — в «Показать подробности…» и в логе."
+        )
+        stamp_scan_intro.setWordWrap(True)
+        stamp_scan_intro.setStyleSheet("color: palette(mid); font-size: 11px;")
+        stamp_scan_layout.addWidget(stamp_scan_intro)
+        self.btn_scan_stamp = QPushButton("Узнать номера ячеек штампа…")
+        self.btn_scan_stamp.setToolTip(
+            "Один .cdw из папки чертежей или проекта: непустые ячейки штампа (для настройки stamp_cells.py)."
+        )
+        self.btn_scan_stamp.clicked.connect(self._on_scan_stamp_clicked)
+        stamp_scan_layout.addWidget(self.btn_scan_stamp)
+        stamp_layout.addWidget(stamp_scan_group)
+
         stamp_buttons_row = QHBoxLayout()
         self.btn_update_stamps = QPushButton("Обновить штампы чертежей")
         self.btn_update_stamps.setEnabled(True)
@@ -417,7 +482,142 @@ class MainWindow(QMainWindow):
         stamp_layout.addLayout(stamp_buttons_row)
         stamp_layout.addStretch(1)
 
-        left_tabs.addTab(self.stamp_tab, "Штампы")
+        left_tabs.addTab(
+            self.stamp_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_FileIcon),
+            "Штампы",
+        )
+
+        # Вкладка «Комплектовщик чертежей»: подвкладки перечень / автонумерация
+        self.packager_tab = QWidget()
+        pack_layout = QVBoxLayout(self.packager_tab)
+
+        pack_top = QHBoxLayout()
+        self.packager_folder_edit = QLineEdit()
+        self.packager_folder_edit.setPlaceholderText(
+            "Папка с чертежами .cdw (по умолчанию — папка проекта)"
+        )
+        self.btn_packager_browse = QPushButton("Папка...")
+        self.btn_packager_browse.clicked.connect(self._on_packager_browse_folder)
+        pack_top.addWidget(self.packager_folder_edit, stretch=1)
+        pack_top.addWidget(self.btn_packager_browse)
+        pack_layout.addLayout(pack_top)
+
+        self.packager_inner_tabs = QTabWidget()
+
+        packager_sub_register = QWidget()
+        reg_layout = QVBoxLayout(packager_sub_register)
+        fr_opts = QHBoxLayout()
+        fr_opts.addWidget(QLabel("Строк в 1-й табл. FRW:"))
+        self.packager_frw_rows_spin = QSpinBox()
+        self.packager_frw_rows_spin.setRange(5, 200)
+        self.packager_frw_rows_spin.setValue(28)
+        fr_opts.addWidget(self.packager_frw_rows_spin)
+        fr_opts.addWidget(QLabel("Выс. строки, мм:"))
+        self.packager_frw_row_h_spin = QDoubleSpinBox()
+        self.packager_frw_row_h_spin.setRange(3.0, 15.0)
+        self.packager_frw_row_h_spin.setSingleStep(0.5)
+        self.packager_frw_row_h_spin.setValue(5.0)
+        fr_opts.addWidget(self.packager_frw_row_h_spin)
+        fr_opts.addWidget(QLabel("Кегль, pt:"))
+        self.packager_frw_font_spin = QDoubleSpinBox()
+        self.packager_frw_font_spin.setRange(2.5, 10.0)
+        self.packager_frw_font_spin.setSingleStep(0.1)
+        self.packager_frw_font_spin.setValue(3.6)
+        fr_opts.addWidget(self.packager_frw_font_spin)
+        reg_layout.addLayout(fr_opts)
+        reg_hint = QLabel(
+            "Таблица совпадает с будущим видом в .frw (титульный лист не входит). "
+            "Загрузите и упорядочьте чертежи на вкладке «Автонумерация файлов». "
+            "Для чертежей узлов в наименование подставляется строка из ячейки материала штампа (номера узлов на листе) — нужен запущенный КОМПАС. "
+            "При необходимости нажмите «Обновить предпросмотр перечня»."
+        )
+        reg_hint.setWordWrap(True)
+        reg_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        reg_layout.addWidget(reg_hint)
+        self.packager_register_table = QTableWidget(0, 3, packager_sub_register)
+        self.packager_register_table.setHorizontalHeaderLabels(list(FRW_REGISTER_HEADER))
+        self.packager_register_table.horizontalHeader().setStretchLastSection(True)
+        self.packager_register_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.packager_register_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        reg_layout.addWidget(self.packager_register_table, stretch=1)
+        reg_btns = QHBoxLayout()
+        self.btn_packager_refresh_register = QPushButton("Обновить предпросмотр перечня")
+        self.btn_packager_refresh_register.clicked.connect(self._packager_refresh_register_preview)
+        self.btn_packager_frw = QPushButton("Экспорт перечня в .frw")
+        self.btn_packager_frw.clicked.connect(self._on_packager_export_frw_clicked)
+        reg_btns.addWidget(self.btn_packager_refresh_register)
+        reg_btns.addStretch(1)
+        reg_btns.addWidget(self.btn_packager_frw)
+        reg_layout.addLayout(reg_btns)
+
+        packager_sub_auto = QWidget()
+        auto_layout = QVBoxLayout(packager_sub_auto)
+        auto_opts = QHBoxLayout()
+        auto_opts.addWidget(QLabel("Литера в штамп (опц.):"))
+        self.packager_litera_edit = QLineEdit()
+        self.packager_litera_edit.setPlaceholderText("как на вкладке «Штампы»")
+        auto_opts.addWidget(self.packager_litera_edit, stretch=1)
+        auto_layout.addLayout(auto_opts)
+        auto_hint = QLabel(
+            "Порядок строк задаёт «N … (лист N)» в именах файлов и нумерацию в штампах. "
+            "Колонка «Файл»: путь хранится в данных строки (редактирование отключено). "
+            "Шаблон Table.frw — каталог table_frw в корне проекта."
+        )
+        auto_hint.setWordWrap(True)
+        auto_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        auto_layout.addWidget(auto_hint)
+        self.packager_table = QTableWidget(0, 4, packager_sub_auto)
+        self.packager_table.setHorizontalHeaderLabels(
+            ["Файл (.cdw)", "Наименование (перечень)", "Новый файл", "Примечание"]
+        )
+        self.packager_table.horizontalHeader().setStretchLastSection(True)
+        self.packager_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked
+        )
+        self.packager_table.itemChanged.connect(self._on_packager_table_item_changed)
+        auto_layout.addWidget(self.packager_table, stretch=1)
+
+        auto_btns = QHBoxLayout()
+        self.btn_packager_load = QPushButton("Загрузить чертежи")
+        self.btn_packager_load.clicked.connect(self._on_packager_load_clicked)
+        self.btn_packager_sort = QPushButton("Порядок: авто")
+        self.btn_packager_sort.clicked.connect(self._on_packager_sort_auto_clicked)
+        self.btn_packager_up = QPushButton("Вверх")
+        self.btn_packager_up.clicked.connect(self._on_packager_move_up)
+        self.btn_packager_down = QPushButton("Вниз")
+        self.btn_packager_down.clicked.connect(self._on_packager_move_down)
+        self.btn_packager_remove = QPushButton("Удалить строку")
+        self.btn_packager_remove.clicked.connect(self._on_packager_remove_row_clicked)
+        self.btn_packager_preview = QPushButton("Обновить предпросмотр имён")
+        self.btn_packager_preview.clicked.connect(self._on_packager_preview_clicked)
+        self.btn_packager_rename = QPushButton("Переименовать + штампы")
+        self.btn_packager_rename.clicked.connect(self._on_packager_rename_and_stamps_clicked)
+        self.btn_packager_stamps = QPushButton("Только штампы (порядок таблицы)")
+        self.btn_packager_stamps.clicked.connect(self._on_packager_stamps_only_clicked)
+        for b in (
+            self.btn_packager_load,
+            self.btn_packager_sort,
+            self.btn_packager_up,
+            self.btn_packager_down,
+            self.btn_packager_remove,
+            self.btn_packager_preview,
+            self.btn_packager_rename,
+            self.btn_packager_stamps,
+        ):
+            auto_btns.addWidget(b)
+        auto_layout.addLayout(auto_btns)
+
+        self.packager_inner_tabs.addTab(packager_sub_register, "Перечень чертежей")
+        self.packager_inner_tabs.addTab(packager_sub_auto, "Автонумерация файлов")
+        self.packager_inner_tabs.setCurrentWidget(packager_sub_auto)
+        pack_layout.addWidget(self.packager_inner_tabs, stretch=1)
+
+        left_tabs.addTab(
+            self.packager_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_DialogOpenButton),
+            "Комплектовщик",
+        )
 
         # Вкладка "Экспорт PDF"
         self.pdf_tab = QWidget()
@@ -429,7 +629,9 @@ class MainWindow(QMainWindow):
 
         pdf_source_row = QHBoxLayout()
         self.pdf_source_folder_edit = QLineEdit()
-        self.pdf_source_folder_edit.setPlaceholderText("Папка с чертежами .cdw (по умолчанию: папка проекта)")
+        self.pdf_source_folder_edit.setPlaceholderText(
+            "Папка с .cdw (независимо от сборки .a3d; пусто — как «Открыть проект»)"
+        )
         self.btn_pdf_source_folder_browse = QPushButton("Папка чертежей...")
         self.btn_pdf_source_folder_browse.clicked.connect(self._browse_pdf_source_folder)
         pdf_source_row.addWidget(self.pdf_source_folder_edit, stretch=1)
@@ -446,7 +648,9 @@ class MainWindow(QMainWindow):
         self.pdf_merge_check = QCheckBox("Объединить все PDF в один файл")
         self.pdf_merge_check.setChecked(True)
         self.pdf_merged_name_edit = QLineEdit()
-        self.pdf_merged_name_edit.setPlaceholderText("Имя объединенного PDF (необязательно)")
+        self.pdf_merged_name_edit.setPlaceholderText(
+            "Необязательно; по умолчанию: «имя_папки_с_cdw - все чертежи.pdf» в папке вывода"
+        )
 
         pdf_export_btn_row = QHBoxLayout()
         self.btn_export_drawings_pdf = QPushButton("Экспорт CDW -> PDF")
@@ -461,7 +665,11 @@ class MainWindow(QMainWindow):
         pdf_group_layout.addRow("", pdf_export_btn_row)
         pdf_layout.addWidget(pdf_group)
         pdf_layout.addStretch(1)
-        left_tabs.addTab(self.pdf_tab, "Экспорт PDF")
+        left_tabs.addTab(
+            self.pdf_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_DialogSaveButton),
+            "Экспорт PDF",
+        )
 
         # Вкладка "Экспорт DWG"
         self.dwg_tab = QWidget()
@@ -473,7 +681,9 @@ class MainWindow(QMainWindow):
 
         dwg_source_row = QHBoxLayout()
         self.dwg_source_folder_edit = QLineEdit()
-        self.dwg_source_folder_edit.setPlaceholderText("Папка с чертежами .cdw (по умолчанию: папка проекта)")
+        self.dwg_source_folder_edit.setPlaceholderText(
+            "Папка с .cdw (независимо от сборки .a3d; пусто — как «Открыть проект»)"
+        )
         self.btn_dwg_source_folder_browse = QPushButton("Папка чертежей...")
         self.btn_dwg_source_folder_browse.clicked.connect(self._browse_dwg_source_folder)
         dwg_source_row.addWidget(self.dwg_source_folder_edit, stretch=1)
@@ -498,7 +708,11 @@ class MainWindow(QMainWindow):
         dwg_group_layout.addRow("", dwg_export_btn_row)
         dwg_layout.addWidget(dwg_group)
         dwg_layout.addStretch(1)
-        left_tabs.addTab(self.dwg_tab, "Экспорт DWG")
+        left_tabs.addTab(
+            self.dwg_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_FileDialogContentsView),
+            "Экспорт DWG",
+        )
 
         # Вкладка "QR-коды"
         self.qr_tab = QWidget()
@@ -524,17 +738,21 @@ class MainWindow(QMainWindow):
         qr_layout.addLayout(qr_form)
 
         qr_buttons_row = QHBoxLayout()
-        btn_qr_browse = QPushButton("Выбрать папку...")
-        btn_qr_browse.clicked.connect(self._browse_qr_folder)
-        btn_qr_generate = QPushButton("Создать QR PNG")
-        btn_qr_generate.clicked.connect(self._on_generate_qr_clicked)
-        qr_buttons_row.addWidget(btn_qr_browse)
-        qr_buttons_row.addWidget(btn_qr_generate)
+        self.btn_qr_folder_browse = QPushButton("Выбрать папку...")
+        self.btn_qr_folder_browse.clicked.connect(self._browse_qr_folder)
+        self.btn_qr_generate = QPushButton("Создать QR PNG")
+        self.btn_qr_generate.clicked.connect(self._on_generate_qr_clicked)
+        qr_buttons_row.addWidget(self.btn_qr_folder_browse)
+        qr_buttons_row.addWidget(self.btn_qr_generate)
 
         qr_layout.addLayout(qr_buttons_row)
         qr_layout.addStretch(1)
 
-        left_tabs.addTab(self.qr_tab, "QR-коды")
+        left_tabs.addTab(
+            self.qr_tab,
+            self._std_icon(QStyle.StandardPixmap.SP_ComputerIcon),
+            "QR-коды",
+        )
 
         splitter.addWidget(left_tabs)
 
@@ -575,11 +793,117 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(splitter, stretch=1)
 
+        self._apply_button_roles()
+        self._apply_visual_theme()
+
         # Привязываем Python-логгер к правой панели
         root_logger = logging.getLogger()
-        qt_handler = QtTextLogHandler(self.log_view)
-        qt_handler.setLevel(logging.INFO)
-        root_logger.addHandler(qt_handler)
+        if not any(isinstance(h, QtTextLogHandler) for h in root_logger.handlers):
+            qt_handler = QtTextLogHandler(self.log_view)
+            qt_handler.setLevel(logging.INFO)
+            root_logger.addHandler(qt_handler)
+            self._qt_log_handler = qt_handler
+
+    def _std_icon(self, which: QStyle.StandardPixmap) -> QIcon:
+        return self.style().standardIcon(which)
+
+    @staticmethod
+    def _mark_button(btn: QPushButton, role: str) -> None:
+        btn.setProperty("nf_role", role)
+
+    def _apply_button_roles(self) -> None:
+        self._mark_button(self.btn_open_project, "tool")
+        self._mark_button(self.btn_copy_target_browse, "tool")
+        self._mark_button(self.btn_copy_and_update, "primary")
+        self._mark_button(self.btn_update_variables, "primary")
+        self._mark_button(self.btn_rescan, "secondary")
+        self._mark_button(self.btn_apply_designation_rules, "secondary")
+        self._mark_button(self.btn_apply_items_meta, "primary")
+        self._mark_button(self.btn_sync_assembly_components, "tool")
+        self._mark_button(self.btn_sheet_folder_browse, "tool")
+        self._mark_button(self.btn_auto_number_sheets, "secondary")
+        self._mark_button(self.btn_scan_stamp, "primary")
+        self._mark_button(self.btn_update_stamps, "primary")
+        self._mark_button(self.btn_packager_browse, "tool")
+        self._mark_button(self.btn_packager_load, "secondary")
+        self._mark_button(self.btn_packager_sort, "tool")
+        self._mark_button(self.btn_packager_up, "tool")
+        self._mark_button(self.btn_packager_down, "tool")
+        self._mark_button(self.btn_packager_remove, "tool")
+        self._mark_button(self.btn_packager_refresh_register, "secondary")
+        self._mark_button(self.btn_packager_preview, "secondary")
+        self._mark_button(self.btn_packager_rename, "primary")
+        self._mark_button(self.btn_packager_stamps, "secondary")
+        self._mark_button(self.btn_packager_frw, "primary")
+        self._mark_button(self.btn_pdf_source_folder_browse, "tool")
+        self._mark_button(self.btn_pdf_export_folder_browse, "tool")
+        self._mark_button(self.btn_export_drawings_pdf, "primary")
+        self._mark_button(self.btn_dwg_source_folder_browse, "tool")
+        self._mark_button(self.btn_dwg_export_folder_browse, "tool")
+        self._mark_button(self.btn_export_drawings_dwg, "primary")
+        self._mark_button(self.btn_qr_folder_browse, "tool")
+        self._mark_button(self.btn_qr_generate, "primary")
+        self._mark_button(self.btn_copy_log, "tool")
+        self._mark_button(self.btn_save_log, "tool")
+        self._mark_button(self.btn_open_log, "tool")
+
+    def _apply_visual_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow { background-color: palette(window); }
+            QTabWidget::pane {
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+            }
+            QGroupBox {
+                font-weight: 600;
+                margin-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }
+            QPushButton[nf_role="primary"] {
+                background-color: #1f7a3f;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-weight: 600;
+                min-height: 1.2em;
+            }
+            QPushButton[nf_role="primary"]:hover { background-color: #1a5c32; }
+            QPushButton[nf_role="primary"]:pressed { background-color: #154a29; }
+            QPushButton[nf_role="primary"]:disabled {
+                background-color: #b8d4b8;
+                color: #e8f5e8;
+            }
+            QPushButton[nf_role="secondary"] {
+                background-color: #1f6feb;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: 500;
+            }
+            QPushButton[nf_role="secondary"]:hover { background-color: #1a5dc3; }
+            QPushButton[nf_role="secondary"]:pressed { background-color: #1552a0; }
+            QPushButton[nf_role="secondary"]:disabled {
+                background-color: #a8c8f0;
+                color: #e8f0fc;
+            }
+            QPushButton[nf_role="tool"] {
+                background-color: palette(button);
+                color: palette(button-text);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                padding: 5px 12px;
+            }
+            QPushButton[nf_role="tool"]:hover { background-color: palette(light); }
+            QPushButton[nf_role="tool"]:pressed { background-color: palette(midlight); }
+            """
+        )
 
     def _setup_menu(self) -> None:
         menubar = self.menuBar()
@@ -739,6 +1063,42 @@ class MainWindow(QMainWindow):
         self.stamp_designation_edit.setText(des)
         self.stamp_name_edit.setText(name)
 
+    def _resolve_export_cdw_folder_or_warn(self, folder_edit: QLineEdit, what: str) -> Optional[Path]:
+        """Существующая папка с .cdw для экспорта или None после QMessageBox."""
+        txt = folder_edit.text().strip()
+        if txt:
+            p = Path(txt)
+            if not p.is_dir():
+                QMessageBox.warning(
+                    self,
+                    "Папка чертежей",
+                    f"Путь для {what} не найден или не является папкой:\n{p}",
+                )
+                return None
+            return p
+        if self._current_project_root and self._current_project_root.is_dir():
+            return self._current_project_root
+        QMessageBox.warning(
+            self,
+            "Папка чертежей",
+            f"Укажите папку с файлами .cdw для {what} (поле «Папка чертежей») "
+            f"или выберите папку через «Открыть проект» (если поле экспорта оставить пустым).",
+        )
+        return None
+
+    def _reset_variables_after_assembly_scan_failed(self, exc: Exception) -> None:
+        """Сброс состояния сборки/переменных при отсутствии .a3d или ошибке сканирования."""
+        self._assembly_info = None
+        self._documents = []
+        self._var_index = {}
+        self._rebuild_variables_form()
+        self.assembly_designation_edit.clear()
+        self.assembly_name_edit.clear()
+        self.btn_update_variables.setEnabled(False)
+        self.btn_rescan.setEnabled(True)
+        self.btn_copy_and_update.setEnabled(False)
+        logger.error("Сканирование сборки: %s", exc)
+
     # ------------------------------------------------------------------
     # Обработчики
     # ------------------------------------------------------------------
@@ -747,7 +1107,7 @@ class MainWindow(QMainWindow):
         """Выбор папки проекта NordFox."""
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Выберите папку проекта NordFox (сборка с .a3d)",
+            "Папка проекта (для переменных нужен .a3d в дереве; для чертежей достаточно любой папки)",
             "",
         )
         if not folder:
@@ -759,6 +1119,19 @@ class MainWindow(QMainWindow):
             self.copy_target_edit.setText(str(self._current_project_root.parent))
         self.statusBar().showMessage(f"Выбрана папка проекта: {self._current_project_root}")
         logger.info(f"Папка проекта: {self._current_project_root}")
+        if not self.packager_folder_edit.text().strip():
+            self.packager_folder_edit.setText(str(self._current_project_root))
+        if not self.pdf_source_folder_edit.text().strip():
+            self.pdf_source_folder_edit.setText(str(self._current_project_root))
+        if not self.dwg_source_folder_edit.text().strip():
+            self.dwg_source_folder_edit.setText(str(self._current_project_root))
+
+        # Завершаем предыдущую JSON-сессию перед открытием нового проекта.
+        if self._json_log:
+            try:
+                self._json_log.close()
+            except Exception as exc:
+                logger.warning("Не удалось закрыть предыдущий JSON-лог: %s", exc)
 
         # Инициализируем JSON-лог для этой сессии/проекта
         from ..__version__ import __version__
@@ -797,11 +1170,15 @@ class MainWindow(QMainWindow):
                 f"Уникальных переменных: {len(var_index)}",
             )
         except Exception as exc:
-            logger.error(f"Ошибка сканирования проекта: {exc}")
-            QMessageBox.critical(
+            self._reset_variables_after_assembly_scan_failed(exc)
+            QMessageBox.warning(
                 self,
-                "Ошибка сканирования",
-                f"Не удалось просканировать проект:\n{exc}",
+                "Сборка не найдена",
+                "В выбранной папке нет файла сборки (*.a3d), либо сканирование завершилось с ошибкой. "
+                "Вкладка «Переменные» и обновление переменных по сборке недоступны.\n\n"
+                "Экспорт PDF/DWG, штампы и комплектовщик работают отдельно: укажите папки с чертежами "
+                "на соответствующих вкладках (при открытии папки они могли подставиться автоматически).\n\n"
+                f"Подробности: {exc}",
             )
 
     def _rebuild_variables_form(self) -> None:
@@ -1743,9 +2120,15 @@ class MainWindow(QMainWindow):
             ]
             logger.info("[Assembly][isolated] run: %s", " ".join(cmd))
             completed = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            stdout = (completed.stdout or "").strip()
+            stderr = (completed.stderr or "").strip()
+            if stdout:
+                for line in stdout.splitlines():
+                    logger.info("[Assembly][isolated][stdout] %s", line)
+            if stderr:
+                for line in stderr.splitlines():
+                    logger.warning("[Assembly][isolated][stderr] %s", line)
             if completed.returncode != 0:
-                stderr = (completed.stderr or "").strip()
-                stdout = (completed.stdout or "").strip()
                 msg = f"Isolated sync завершился с кодом {completed.returncode}."
                 if stderr:
                     msg += f" stderr: {stderr}"
@@ -1789,11 +2172,30 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
-    def _on_rescan_clicked(self) -> None:
-        """Пересканировать текущий проект (подхватить внешние изменения)."""
+    def _rescan_project(self, *, show_progress: bool = True) -> bool:
+        """
+        Пересканировать текущий проект. При ``show_progress=False`` не показывать отдельное окно
+        (используется внутри сценария «Создать проект» с общим индикатором).
+        """
         if not self._current_project_root:
-            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
-            return
+            if show_progress:
+                QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
+            return False
+
+        progress: QProgressDialog | None = None
+        if show_progress:
+            progress = QProgressDialog(
+                "Пересканирование проекта...",
+                None,
+                0,
+                0,
+                self,
+            )
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setAutoClose(True)
+            progress.setCancelButton(None)
+            progress.show()
+            QApplication.processEvents()
 
         try:
             assembly_info, documents, var_index = scan_project(self._current_project_root, self._kompas)
@@ -1812,13 +2214,22 @@ class MainWindow(QMainWindow):
                 self._json_log.set_project_state(state)
 
             self.statusBar().showMessage("Пересканирование проекта завершено", 5000)
+            return True
         except Exception as exc:
-            logger.error(f"Ошибка пересканирования проекта: {exc}")
+            self._reset_variables_after_assembly_scan_failed(exc)
             QMessageBox.critical(
                 self,
                 "Ошибка пересканирования",
                 f"Не удалось пересканировать проект:\n{exc}",
             )
+            return False
+        finally:
+            if progress is not None:
+                progress.close()
+
+    def _on_rescan_clicked(self) -> None:
+        """Пересканировать текущий проект (подхватить внешние изменения)."""
+        self._rescan_project(show_progress=True)
 
     def _browse_qr_folder(self) -> None:
         """Выбор папки для сохранения QR PNG."""
@@ -1996,24 +2407,43 @@ class MainWindow(QMainWindow):
         self,
         changed_values: Dict[str, float],
         changed_comments: Dict[str, str],
-    ) -> None:
+        *,
+        ui_silent: bool = False,
+        existing_progress: QProgressDialog | None = None,
+    ) -> Dict[str, object]:
+        """
+        Обновить переменные в КОМПАС.
+        При ``ui_silent=True`` не показывать отдельные окна (сценарий «Создать проект»).
+        """
+        empty: Dict[str, object] = {
+            "success": False,
+            "documents_updated": 0,
+            "variables_updated": 0,
+            "errors": [],
+        }
         if self._updating_in_progress:
-            return
+            return empty
         if not self._assembly_info:
-            QMessageBox.warning(self, "Нет сборки", "Проект не просканирован.")
-            return
+            if not ui_silent:
+                QMessageBox.warning(self, "Нет сборки", "Проект не просканирован.")
+            return empty
 
         self._updating_in_progress = True
-        progress = QProgressDialog(
-            "Обновление переменных в проекте...",
-            None,
-            0,
-            0,
-            self,
-        )
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setAutoClose(True)
-        progress.setCancelButton(None)
+        own_progress = existing_progress is None
+        if own_progress:
+            progress = QProgressDialog(
+                "Обновление переменных в проекте...",
+                None,
+                0,
+                0,
+                self,
+            )
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setAutoClose(True)
+            progress.setCancelButton(None)
+        else:
+            progress = existing_progress
+            progress.setLabelText("Обновление переменных в проекте...")
         progress.show()
         QApplication.processEvents()
 
@@ -2026,7 +2456,8 @@ class MainWindow(QMainWindow):
                 changed_comments or None,
             )
         finally:
-            progress.close()
+            if own_progress:
+                progress.close()
             self._updating_in_progress = False
 
         if self._json_log:
@@ -2041,27 +2472,36 @@ class MainWindow(QMainWindow):
                 meta={"errors": result.get("errors", [])},
             )
 
-        if result.get("success"):
-            self.statusBar().showMessage(
-                f"Переменные обновлены: документов={result.get('documents_updated')}, "
-                f"переменных={result.get('variables_updated')}",
-                5000,
-            )
-            QMessageBox.information(
-                self,
-                "Готово",
-                f"Переменные обновлены.\n"
-                f"Документов: {result.get('documents_updated')}\n"
-                f"Переменных: {result.get('variables_updated')}",
-            )
+        if not ui_silent:
+            if result.get("success"):
+                self.statusBar().showMessage(
+                    f"Переменные обновлены: документов={result.get('documents_updated')}, "
+                    f"переменных={result.get('variables_updated')}",
+                    5000,
+                )
+                QMessageBox.information(
+                    self,
+                    "Готово",
+                    f"Переменные обновлены.\n"
+                    f"Документов: {result.get('documents_updated')}\n"
+                    f"Переменных: {result.get('variables_updated')}",
+                )
+            else:
+                errors = result.get("errors") or []
+                msg = "\n".join(str(e) for e in errors) or "Неизвестная ошибка"
+                QMessageBox.critical(
+                    self,
+                    "Ошибки при обновлении",
+                    f"Во время обновления возникли ошибки:\n{msg}",
+                )
         else:
-            errors = result.get("errors") or []
-            msg = "\n".join(str(e) for e in errors) or "Неизвестная ошибка"
-            QMessageBox.critical(
-                self,
-                "Ошибки при обновлении",
-                f"Во время обновления возникли ошибки:\n{msg}",
-            )
+            if result.get("success"):
+                self.statusBar().showMessage(
+                    f"Переменные обновлены: документов={result.get('documents_updated')}, "
+                    f"переменных={result.get('variables_updated')}",
+                    5000,
+                )
+        return result
 
     def _on_copy_and_update_clicked(
         self,
@@ -2072,9 +2512,42 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
             return
 
+        target_text = self.copy_target_edit.text().strip()
+        if not target_text:
+            QMessageBox.warning(self, "Нет папки копии", "Укажите папку назначения для копии проекта.")
+            return
+        target_parent = Path(target_text)
+        if not target_parent.exists():
+            QMessageBox.warning(self, "Папка не найдена", f"Папка назначения не существует:\n{target_parent}")
+            return
+
+        QMessageBox.information(
+            self,
+            "Копирование проекта",
+            "Сейчас будет создана копия папки проекта.\n\n"
+            "Перед началом закройте в КОМПАС-3D все открытые документы этого проекта "
+            "или сохраните изменения и закройте файлы — иначе возможны ошибки доступа к файлам.",
+        )
+
+        progress = QProgressDialog(
+            "Создание проекта...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(True)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+
         changed_values: Dict[str, float] = {}
         changed_comments: Dict[str, str] = {}
         source_root = self._current_project_root
+        progress.setLabelText("Подготовка данных...")
+        QApplication.processEvents()
+
         if isinstance(prepared_payload, tuple):
             changed_values, changed_comments = prepared_payload
         else:
@@ -2097,29 +2570,15 @@ class MainWindow(QMainWindow):
             if payload_meta:
                 item_updates_by_key[doc_path] = payload_meta
 
-        target_text = self.copy_target_edit.text().strip()
-        if not target_text:
-            QMessageBox.warning(self, "Нет папки копии", "Укажите папку назначения для копии проекта.")
-            return
-        target_parent = Path(target_text)
-        if not target_parent.exists():
-            QMessageBox.warning(self, "Папка не найдена", f"Папка назначения не существует:\n{target_parent}")
-            return
-
-        progress = QProgressDialog(
-            "Копирование проекта...",
-            None,
-            0,
-            0,
-            self,
-        )
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setAutoClose(True)
-        progress.setCancelButton(None)
-        progress.show()
-        QApplication.processEvents()
-
+        var_result: Dict[str, object] = {
+            "success": True,
+            "documents_updated": 0,
+            "variables_updated": 0,
+            "errors": [],
+        }
         try:
+            progress.setLabelText("Копирование файлов...")
+            QApplication.processEvents()
             folder_name = self.assembly_name_edit.text().strip()
             if not folder_name and self._assembly_info:
                 folder_name = (self._assembly_info.name or "").strip()
@@ -2128,73 +2587,105 @@ class MainWindow(QMainWindow):
                 target_parent,
                 new_name=folder_name or None,
             )
-        finally:
-            progress.close()
 
-        if not copy_result.get("success"):
-            QMessageBox.critical(self, "Ошибка копирования", str(copy_result.get("error", "Unknown error")))
-            return
+            if not copy_result.get("success"):
+                QMessageBox.critical(self, "Ошибка копирования", str(copy_result.get("error", "Unknown error")))
+                return
 
-        copied_path = Path(str(copy_result["target"]))
-        self._current_project_root = copied_path
-        self.project_path_edit.setText(str(copied_path))
-        self.statusBar().showMessage(f"Работаем с копией проекта: {copied_path}", 5000)
-        logger.info("Этап 0/3: проект скопирован в %s", copied_path)
+            copied_path = Path(str(copy_result["target"]))
+            self._current_project_root = copied_path
+            self.project_path_edit.setText(str(copied_path))
+            self.statusBar().showMessage(f"Работаем с копией проекта: {copied_path}", 5000)
+            logger.info("Этап 0/3: проект скопирован в %s", copied_path)
 
-        try:
-            assembly_info, documents, var_index = scan_project(copied_path, self._kompas)
-            self._assembly_info = assembly_info
-            self._documents = documents
-            self._var_index = var_index
-            self._rebuild_variables_form()
-            self._sync_assembly_and_stamp_fields()
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка сканирования", f"Не удалось просканировать копию:\n{exc}")
-            return
+            progress.setLabelText("Сканирование копии...")
+            QApplication.processEvents()
+            if not self._rescan_project(show_progress=False):
+                return
 
-        if changed_values or changed_comments:
-            self._run_update_with_payload(changed_values, changed_comments)
-
-        # После пересчета переменных заново читаем проект и строим обозн./наимен.
-        self._on_rescan_clicked()
-        auto_filled = self._fill_item_metadata_by_rules()
-        auto_item_updates = self._collect_item_metadata_payload()
-
-        # Ручные значения, которые были заполнены до копирования, должны иметь приоритет.
-        item_updates_copy: Dict[Path, Dict[str, str]] = dict(auto_item_updates)
-        for src_doc_path, payload_meta in item_updates_by_key.items():
-            if source_root is None:
-                continue
-            try:
-                rel = src_doc_path.relative_to(source_root)
-            except ValueError:
-                continue
-            dst_doc_path = copied_path / rel
-            existed = item_updates_copy.get(dst_doc_path, {})
-            existed.update(payload_meta)
-            item_updates_copy[dst_doc_path] = existed
-
-        if item_updates_copy:
-            meta_result = self._apply_item_metadata_updates(item_updates_copy, sync_assembly_components=False)
-            if not meta_result.get("success"):
-                errors = meta_result.get("errors") or []
-                QMessageBox.warning(
-                    self,
-                    "Частичные ошибки",
-                    "Копия создана и переменные обновлены, но часть обозначений/наименований не записалась:\n"
-                    + "\n".join(str(e) for e in errors),
+            if changed_values or changed_comments:
+                progress.setLabelText("Обновление переменных...")
+                QApplication.processEvents()
+                var_result = self._run_update_with_payload(
+                    changed_values,
+                    changed_comments,
+                    ui_silent=True,
+                    existing_progress=progress,
                 )
 
-        self._on_rescan_clicked()
-        QMessageBox.information(
-            self,
-            "Проект создан",
-            f"Копия проекта создана:\n{copied_path}\n\n"
-            f"Переменных к обновлению: {len(changed_values)}\n"
-            f"Комментариев чертежей: {len(changed_comments)}\n"
-            f"Обозн./наимен. к применению: {len(item_updates_copy)}\n"
-            f"Автоподстановка по правилам: обозн. {auto_filled['markings']}, наимен. {auto_filled['names']}",
-        )
+            progress.setLabelText("Пересканирование...")
+            QApplication.processEvents()
+            if not self._rescan_project(show_progress=False):
+                return
+
+            auto_filled = self._fill_item_metadata_by_rules()
+            auto_item_updates = self._collect_item_metadata_payload()
+
+            # Ручные значения, которые были заполнены до копирования, должны иметь приоритет.
+            item_updates_copy: Dict[Path, Dict[str, str]] = dict(auto_item_updates)
+            for src_doc_path, payload_meta in item_updates_by_key.items():
+                try:
+                    rel = src_doc_path.relative_to(source_root)
+                except ValueError:
+                    continue
+                dst_doc_path = copied_path / rel
+                existed = item_updates_copy.get(dst_doc_path, {})
+                existed.update(payload_meta)
+                item_updates_copy[dst_doc_path] = existed
+
+            # Не записываем обозначение/наименование в файл сборки при создании копии — иначе
+            # ломаются связи чертежа с исполнением (конфликт с суффиксом исполнения).
+            if self._assembly_info:
+                asm_path = self._assembly_info.path.resolve()
+                if asm_path in item_updates_copy:
+                    del item_updates_copy[asm_path]
+                    logger.info(
+                        "[Copy] Пропуск записи обозначения/наименования сборки: %s",
+                        asm_path,
+                    )
+
+            meta_result: Dict[str, object] = {"success": True, "errors": []}
+            if item_updates_copy:
+                progress.setLabelText("Запись обозначений и наименований...")
+                QApplication.processEvents()
+                meta_result = self._apply_item_metadata_updates(item_updates_copy, sync_assembly_components=False)
+
+            progress.setLabelText("Пересканирование...")
+            QApplication.processEvents()
+            self._rescan_project(show_progress=False)
+
+            # Одно итоговое сообщение
+            lines: list[str] = [
+                f"Копия проекта создана:",
+                str(copied_path),
+                "",
+                f"Обновлено переменных: {var_result.get('variables_updated', 0)} "
+                f"(документов: {var_result.get('documents_updated', 0)}).",
+            ]
+            if not var_result.get("success"):
+                verr = var_result.get("errors") or []
+                lines.append("")
+                lines.append("Ошибки при обновлении переменных:")
+                lines.extend(str(e) for e in verr[:12])
+
+            meta_fields = int(meta_result.get("fields_updated", 0) or 0)
+            meta_docs = int(meta_result.get("documents_updated", 0) or 0)
+            lines.append("")
+            lines.append(
+                f"Записано обозначений/наименований: полей {meta_fields}, документов {meta_docs}."
+            )
+            lines.append(
+                f"Автоподстановка по правилам: обозн. {auto_filled['markings']}, наимен. {auto_filled['names']}."
+            )
+            if not meta_result.get("success"):
+                merr = meta_result.get("errors") or []
+                lines.append("")
+                lines.append("Часть обозначений/наименований не записалась:")
+                lines.extend(str(e) for e in merr[:12])
+
+            QMessageBox.information(self, "Проект создан", "\n".join(lines))
+        finally:
+            progress.close()
 
     def _on_update_variables_clicked(self) -> None:
         """
@@ -2205,56 +2696,146 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
             return
 
-        payload = self._collect_update_payload()
-        if payload is None:
-            return
-        changed_values, changed_comments = payload
-        item_updates = self._collect_item_metadata_payload()
+        progress = QProgressDialog(
+            "Обновление проекта...",
+            None,
+            0,
+            0,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(True)
+        progress.setCancelButton(None)
+        progress.setLabelText("Подготовка...")
+        progress.show()
+        QApplication.processEvents()
 
-        if not changed_values and not changed_comments and not item_updates:
-            QMessageBox.information(
+        try:
+            payload = self._collect_update_payload()
+            if payload is None:
+                return
+            changed_values, changed_comments = payload
+            item_updates = self._collect_item_metadata_payload()
+
+            if not changed_values and not changed_comments and not item_updates:
+                QMessageBox.information(
+                    self,
+                    "Нет изменений",
+                    "Не изменены ни переменные/комментарии, ни поля «Новое обозначение/наименование».",
+                )
+                return
+
+            if changed_values or changed_comments:
+                progress.setLabelText("Обновление переменных в проекте...")
+                QApplication.processEvents()
+                self._run_update_with_payload(
+                    changed_values,
+                    changed_comments,
+                    existing_progress=progress,
+                )
+                # Важно: читаем из Kompas уже пересчитанные формулами значения.
+                progress.setLabelText("Пересканирование...")
+                QApplication.processEvents()
+                self._rescan_project(show_progress=False)
+                self._fill_item_metadata_by_rules()
+                # Добавляем автоматические значения, но оставляем ручные как приоритет.
+                auto_updates = self._collect_item_metadata_payload()
+                for p, meta_payload in auto_updates.items():
+                    existed = item_updates.get(p, {})
+                    merged = dict(meta_payload)
+                    merged.update(existed)
+                    item_updates[p] = merged
+
+            if item_updates:
+                progress.setLabelText("Запись обозначений и наименований...")
+                QApplication.processEvents()
+                meta_result = self._apply_item_metadata_updates(item_updates, sync_assembly_components=False)
+                time.sleep(0.8)
+                progress.setLabelText("Синхронизация вхождений в сборке...")
+                QApplication.processEvents()
+                sync_result = self._run_isolated_assembly_sync(item_updates)
+                if not meta_result.get("success"):
+                    errors = meta_result.get("errors") or []
+                    QMessageBox.warning(
+                        self,
+                        "Частичные ошибки",
+                        "Переменные обновлены, но часть обозначений/наименований не записалась:\n"
+                        + "\n".join(str(e) for e in errors),
+                    )
+                if not sync_result.get("success"):
+                    errors = sync_result.get("errors") or []
+                    QMessageBox.warning(
+                        self,
+                        "Частичные ошибки синхронизации",
+                        "Переменные обновлены, но синхронизация вхождений сборки завершилась с ошибками:\n"
+                        + "\n".join(str(e) for e in errors),
+                    )
+
+            # После записи в документы обновляем эталонные значения в UI.
+            progress.setLabelText("Пересканирование...")
+            QApplication.processEvents()
+            self._rescan_project(show_progress=False)
+        finally:
+            progress.close()
+
+    def _stamp_cdw_folder_for_open_dialog(self) -> Path:
+        """Папка для выбора .cdw: поле «Папка чертежей» или папка проекта."""
+        txt = self.stamp_sheet_folder_edit.text().strip()
+        if txt:
+            p = Path(txt)
+            if p.is_dir():
+                return p
+        if self._current_project_root and self._current_project_root.is_dir():
+            return self._current_project_root
+        return Path.home()
+
+    def _on_scan_stamp_clicked(self) -> None:
+        """Один .cdw: прочитать непустые ячейки штампа (без сохранения документа)."""
+        start_dir = str(self._stamp_cdw_folder_for_open_dialog())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите чертёж .cdw с заполненным штампом",
+            start_dir,
+            "Чертеж КОМПАС (*.cdw);;Все файлы (*.*)",
+        )
+        if not path:
+            return
+
+        logger.info("Сканирование штампа: файл %s", path)
+        res = scan_stamp_cells_non_empty(self._kompas, Path(path))
+        if not res.get("success"):
+            QMessageBox.warning(
                 self,
-                "Нет изменений",
-                "Не изменены ни переменные/комментарии, ни поля «Новое обозначение/наименование».",
+                "Номера ячеек штампа",
+                str(res.get("error") or "Неизвестная ошибка"),
             )
             return
 
-        if changed_values or changed_comments:
-            self._run_update_with_payload(changed_values, changed_comments)
-            # Важно: читаем из Kompas уже пересчитанные формулами значения.
-            self._on_rescan_clicked()
-            self._fill_item_metadata_by_rules()
-            # Добавляем автоматические значения, но оставляем ручные как приоритет.
-            auto_updates = self._collect_item_metadata_payload()
-            for p, payload in auto_updates.items():
-                existed = item_updates.get(p, {})
-                merged = dict(payload)
-                merged.update(existed)
-                item_updates[p] = merged
+        cells = res.get("cells") or []
+        lines = [f"{idx}: {val}" for idx, val in cells]
+        detail = (
+            "\n".join(lines)
+            if lines
+            else "(непустых ячеек не найдено в диапазоне 1…220 — сохраните штамп в КОМПАС и повторите)"
+        )
+        ref = (
+            f"\n\nТекущие константы stamp_cells.py:\n"
+            f"NAME={STAMP_CELLS.NAME}, DESIGNATION={STAMP_CELLS.DESIGNATION}, MATERIAL={STAMP_CELLS.MATERIAL},\n"
+            f"SHEET_TOTAL={STAMP_CELLS.SHEET_TOTAL}, SHEET_CURRENT={STAMP_CELLS.SHEET_CURRENT},\n"
+            f"LETTER1={STAMP_CELLS.DOCUMENT_LETTER1}, LETTER2={STAMP_CELLS.DOCUMENT_LETTER2}, LETTER3={STAMP_CELLS.DOCUMENT_LETTER3}"
+        )
 
-        if item_updates:
-            meta_result = self._apply_item_metadata_updates(item_updates, sync_assembly_components=False)
-            time.sleep(0.8)
-            sync_result = self._run_isolated_assembly_sync(item_updates)
-            if not meta_result.get("success"):
-                errors = meta_result.get("errors") or []
-                QMessageBox.warning(
-                    self,
-                    "Частичные ошибки",
-                    "Переменные обновлены, но часть обозначений/наименований не записалась:\n"
-                    + "\n".join(str(e) for e in errors),
-                )
-            if not sync_result.get("success"):
-                errors = sync_result.get("errors") or []
-                QMessageBox.warning(
-                    self,
-                    "Частичные ошибки синхронизации",
-                    "Переменные обновлены, но синхронизация вхождений сборки завершилась с ошибками:\n"
-                    + "\n".join(str(e) for e in errors),
-                )
-
-        # После записи в документы обновляем эталонные значения в UI.
-        self._on_rescan_clicked()
+        box = QMessageBox(self)
+        box.setWindowTitle("Номера ячеек штампа")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"Файл: {Path(path).name}\n"
+            f"Найдено непустых ячеек: {len(cells)}.\n"
+            f"«Показать подробности…» — список «номер: текст». "
+            f"То же в панели логов внизу."
+        )
+        box.setDetailedText(detail + ref)
+        box.exec()
 
     def _on_update_stamps_clicked(self) -> None:
         """Обновление штампов всех чертежей проекта."""
@@ -2264,6 +2845,7 @@ class MainWindow(QMainWindow):
 
         designation = self.stamp_designation_edit.text().strip() or None
         name = self.stamp_name_edit.text().strip() or None
+        document_letter = self.stamp_litera_edit.text().strip() or None
 
         developer = self.stamp_developer_edit.currentText().strip() or None
         checker = self.stamp_checker_edit.currentText().strip() or None
@@ -2298,6 +2880,8 @@ class MainWindow(QMainWindow):
             sheet_mode = "manual"
             sheet_current = sc
             sheet_total = st
+        elif self.stamp_sheet_auto_check.isChecked():
+            sheet_mode = "batch"
 
         if date is None and any([developer, checker, tech_control, norm_control, approved]):
             date = QDateTime.currentDateTime().date().toString("dd.MM.yyyy")
@@ -2329,6 +2913,7 @@ class MainWindow(QMainWindow):
                 date,
                 designation,
                 name,
+                document_letter,
                 has_sheet,
             ]
         ):
@@ -2364,6 +2949,7 @@ class MainWindow(QMainWindow):
             role_dates=role_dates or None,
             designation=designation,
             name=name,
+            document_letter=document_letter,
             sheet_mode=sheet_mode,
             sheet_current=sheet_current,
             sheet_total=sheet_total,
@@ -2378,6 +2964,7 @@ class MainWindow(QMainWindow):
                 input_={
                     "designation": designation,
                     "name": name,
+                    "document_letter": document_letter,
                     "developer": developer,
                     "checker": checker,
                     "organization": organization,
@@ -2419,14 +3006,11 @@ class MainWindow(QMainWindow):
 
     def _on_export_drawings_pdf_clicked(self) -> None:
         """Экспорт всех CDW чертежей в PDF через локальный сервис."""
-        if not self._current_project_root:
-            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
-            return
-
-        source_folder_text = self.pdf_source_folder_edit.text().strip()
-        source_root = Path(source_folder_text) if source_folder_text else self._current_project_root
-        if not source_root.exists():
-            QMessageBox.warning(self, "Папка не найдена", f"Папка с чертежами не существует:\n{source_root}")
+        source_root = self._resolve_export_cdw_folder_or_warn(
+            self.pdf_source_folder_edit,
+            "экспорта в PDF",
+        )
+        if source_root is None:
             return
 
         output_folder_text = self.pdf_export_folder_edit.text().strip()
@@ -2485,21 +3069,30 @@ class MainWindow(QMainWindow):
             merged_pdf = result.get("merged_pdf")
             if merged_pdf:
                 info_lines.append(f"Объединенный PDF:\n{merged_pdf}")
-            elif merge_into_one:
-                # Экспорт может пройти успешно, но объединение не выполниться.
-                # Показываем причину прямо в success-окне, чтобы это было видно пользователю.
-                merge_errors = [
+            elif merge_into_one and int(result.get("exported_pdfs") or 0) > 0:
+                default_name = f"{source_root.name} - все чертежи.pdf"
+                info_lines.append(
+                    f"Объединённый файл не создан (имя в поле необязательно; по умолчанию было бы «{default_name}»)."
+                )
+                merge_errs = [
                     str(e)
                     for e in (result.get("errors") or [])
-                    if str(e).startswith("PDF merge error")
-                    or str(e).startswith("No readable PDF files to merge")
-                    or str(e).startswith("No valid PDF files to merge")
-                    or str(e).startswith("pypdf is not installed")
-                    or str(e).startswith("Merge skip:")
+                    if str(e).startswith("Merge:")
+                        or str(e).startswith("Merge skip:")
+                        or "merge" in str(e).lower()
+                        or "pypdf" in str(e).lower()
+                        or "readable PDF" in str(e)
+                        or "valid PDF" in str(e)
                 ]
-                if merge_errors:
-                    info_lines.append("Объединение PDF не выполнено:")
-                    info_lines.extend(merge_errors[:8])
+                if not merge_errs:
+                    merge_errs = [str(e) for e in (result.get("errors") or []) if str(e)]
+                if merge_errs:
+                    info_lines.append("Причина / диагностика:")
+                    info_lines.extend(merge_errs[:12])
+                else:
+                    info_lines.append(
+                        "Проверьте установку: pip install pypdf (или обновите зависимости проекта)."
+                    )
 
             self.statusBar().showMessage(
                 f"Экспорт PDF завершен: {result.get('exported_pdfs', 0)} из {result.get('total_drawings', 0)}",
@@ -2517,14 +3110,11 @@ class MainWindow(QMainWindow):
 
     def _on_export_drawings_dwg_clicked(self) -> None:
         """Прямой экспорт всех CDW чертежей в DWG через локальный сервис."""
-        if not self._current_project_root:
-            QMessageBox.warning(self, "Нет проекта", "Сначала выберите папку проекта.")
-            return
-
-        source_folder_text = self.dwg_source_folder_edit.text().strip()
-        source_root = Path(source_folder_text) if source_folder_text else self._current_project_root
-        if not source_root.exists():
-            QMessageBox.warning(self, "Папка не найдена", f"Папка с чертежами не существует:\n{source_root}")
+        source_root = self._resolve_export_cdw_folder_or_warn(
+            self.dwg_source_folder_edit,
+            "экспорта в DWG",
+        )
+        if source_root is None:
             return
 
         output_folder_text = self.dwg_export_folder_edit.text().strip()
@@ -2612,9 +3202,11 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
+        litera = self.stamp_litera_edit.text().strip() or None
         result = update_all_drawing_stamps(
             self._kompas,
             root,
+            document_letter=litera,
             sheet_mode="batch",
         )
         progress.close()
@@ -2634,6 +3226,350 @@ class MainWindow(QMainWindow):
                 "Ошибки нумерации",
                 "Во время автонумерации возникли ошибки:\n" + "\n".join(str(e) for e in errors),
             )
+
+    # --- Комплектовщик чертежей ---
+
+    def _packager_root(self) -> Optional[Path]:
+        txt = self.packager_folder_edit.text().strip()
+        if txt:
+            p = Path(txt)
+            return p if p.is_dir() else None
+        return self._current_project_root
+
+    def _on_packager_browse_folder(self) -> None:
+        start = str(self._packager_root() or self._current_project_root or "")
+        folder = QFileDialog.getExistingDirectory(self, "Папка с чертежами .cdw", start)
+        if folder:
+            self.packager_folder_edit.setText(folder)
+
+    def _packager_path_from_row(self, row: int) -> Optional[Path]:
+        it = self.packager_table.item(row, 0)
+        if not it:
+            return None
+        data = it.data(Qt.ItemDataRole.UserRole)
+        if data:
+            return Path(str(data))
+        return None
+
+    def _packager_fill_table(self, paths: List[Path]) -> None:
+        self.packager_table.blockSignals(True)
+        try:
+            self.packager_table.setRowCount(0)
+            for i, p in enumerate(paths):
+                self.packager_table.insertRow(i)
+                _lead, mid, _sheet = parse_cdw_stem(p.stem)
+                new_name = build_new_filename(mid, i + 1)
+                f_item = QTableWidgetItem(p.name)
+                f_item.setData(Qt.ItemDataRole.UserRole, str(p.resolve()))
+                f_item.setFlags(
+                    (f_item.flags() | Qt.ItemFlag.ItemIsSelectable)
+                    & ~Qt.ItemFlag.ItemIsEditable
+                )
+                self.packager_table.setItem(i, 0, f_item)
+                self.packager_table.setItem(i, 1, QTableWidgetItem(mid))
+                self.packager_table.setItem(i, 2, QTableWidgetItem(new_name))
+                self.packager_table.setItem(i, 3, QTableWidgetItem(""))
+        finally:
+            self.packager_table.blockSignals(False)
+        self._on_packager_preview_clicked()
+
+    def _packager_register_rows_for_frw(self) -> List[tuple[str, str, str]]:
+        """Строки перечня как в .frw: титул не входит; «Лист» — 1…N по порядку в таблице."""
+        rows: List[tuple[str, str, str]] = []
+        seq = 0
+        for r in range(self.packager_table.rowCount()):
+            p = self._packager_path_from_row(r)
+            if not p or is_drawing_title_sheet(p):
+                continue
+            seq += 1
+            itn = self.packager_table.item(r, 1)
+            itp = self.packager_table.item(r, 3)
+            raw_name = itn.text().strip() if itn else ""
+            name = format_register_name_from_middle(raw_name)
+            if is_drawing_node_sheet(p):
+                mat_line = read_stamp_cell_str(self._kompas, p, STAMP_CELLS.MATERIAL)
+                if mat_line:
+                    name = append_material_to_register_line(name, mat_line)
+            note = itp.text().strip() if itp else ""
+            rows.append((str(seq), name, note))
+        return rows
+
+    def _packager_refresh_register_preview(self) -> None:
+        rows = self._packager_register_rows_for_frw()
+        t = self.packager_register_table
+        t.setRowCount(len(rows))
+        for i, (sheet, name, note) in enumerate(rows):
+            for c, val in enumerate((sheet, name, note)):
+                it = QTableWidgetItem(val)
+                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                t.setItem(i, c, it)
+
+    def _on_packager_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() not in (1, 3):
+            return
+        if item.column() == 1:
+            r = item.row()
+            p = self._packager_path_from_row(r)
+            if not p:
+                return
+            mid = item.text().strip()
+            new_name = build_new_filename(mid, r + 1)
+            self.packager_table.blockSignals(True)
+            try:
+                if self.packager_table.item(r, 2) is None:
+                    self.packager_table.setItem(r, 2, QTableWidgetItem())
+                self.packager_table.item(r, 2).setText(new_name)
+            finally:
+                self.packager_table.blockSignals(False)
+        self._packager_refresh_register_preview()
+
+    def _on_packager_remove_row_clicked(self) -> None:
+        r = self.packager_table.currentRow()
+        if r < 0:
+            return
+        self.packager_table.removeRow(r)
+        self._on_packager_preview_clicked()
+
+    def _packager_paths_from_table(self) -> List[Path]:
+        out: List[Path] = []
+        for r in range(self.packager_table.rowCount()):
+            p = self._packager_path_from_row(r)
+            if p:
+                out.append(p)
+        return out
+
+    def _packager_middles_from_table(self, paths: List[Path]) -> List[str]:
+        mids: List[str] = []
+        for r, p in enumerate(paths):
+            _l, mid, _s = parse_cdw_stem(p.stem)
+            it = self.packager_table.item(r, 1)
+            if it and it.text().strip():
+                mid = it.text().strip()
+            mids.append(mid)
+        return mids
+
+    def _on_packager_load_clicked(self) -> None:
+        root = self._packager_root()
+        if not root:
+            QMessageBox.warning(
+                self,
+                "Папка",
+                "Укажите существующую папку с чертежами или откройте проект.",
+            )
+            return
+        drawings = collect_drawings_for_stamps(root)
+        self._packager_fill_table(drawings)
+
+    def _on_packager_sort_auto_clicked(self) -> None:
+        root = self._packager_root()
+        if not root:
+            QMessageBox.warning(self, "Папка", "Укажите папку с чертежами.")
+            return
+        drawings = sort_drawings_for_sheet_numbering(collect_drawings_for_stamps(root))
+        self._packager_fill_table(drawings)
+
+    def _on_packager_preview_clicked(self) -> None:
+        self.packager_table.blockSignals(True)
+        try:
+            for r in range(self.packager_table.rowCount()):
+                p = self._packager_path_from_row(r)
+                if not p:
+                    continue
+                _l, mid, _s = parse_cdw_stem(p.stem)
+                it_mid = self.packager_table.item(r, 1)
+                if it_mid and it_mid.text().strip():
+                    mid = it_mid.text().strip()
+                new_name = build_new_filename(mid, r + 1)
+                if self.packager_table.item(r, 2) is None:
+                    self.packager_table.setItem(r, 2, QTableWidgetItem())
+                self.packager_table.item(r, 2).setText(new_name)
+                if self.packager_table.item(r, 0) is None:
+                    it0 = QTableWidgetItem(p.name)
+                    it0.setData(Qt.ItemDataRole.UserRole, str(p.resolve()))
+                    it0.setFlags(
+                        (it0.flags() | Qt.ItemFlag.ItemIsSelectable)
+                        & ~Qt.ItemFlag.ItemIsEditable
+                    )
+                    self.packager_table.setItem(r, 0, it0)
+                else:
+                    it0 = self.packager_table.item(r, 0)
+                    it0.setText(p.name)
+                    it0.setData(Qt.ItemDataRole.UserRole, str(p.resolve()))
+                    it0.setFlags(
+                        (it0.flags() | Qt.ItemFlag.ItemIsSelectable)
+                        & ~Qt.ItemFlag.ItemIsEditable
+                    )
+        finally:
+            self.packager_table.blockSignals(False)
+        self._packager_refresh_register_preview()
+
+    def _packager_swap_rows(self, a: int, b: int) -> None:
+        for c in range(self.packager_table.columnCount()):
+            ia = self.packager_table.takeItem(a, c)
+            ib = self.packager_table.takeItem(b, c)
+            self.packager_table.setItem(a, c, ib)
+            self.packager_table.setItem(b, c, ia)
+
+    def _on_packager_move_up(self) -> None:
+        r = self.packager_table.currentRow()
+        if r <= 0:
+            return
+        self._packager_swap_rows(r, r - 1)
+        self._on_packager_preview_clicked()
+        self.packager_table.setCurrentCell(r - 1, 0)
+
+    def _on_packager_move_down(self) -> None:
+        r = self.packager_table.currentRow()
+        if r < 0 or r >= self.packager_table.rowCount() - 1:
+            return
+        self._packager_swap_rows(r, r + 1)
+        self._on_packager_preview_clicked()
+        self.packager_table.setCurrentCell(r + 1, 0)
+
+    def _on_packager_rename_and_stamps_clicked(self) -> None:
+        paths = self._packager_paths_from_table()
+        if not paths:
+            QMessageBox.information(self, "Нет данных", "Загрузите чертежи или проверьте таблицу.")
+            return
+        self._on_packager_preview_clicked()
+        mids = self._packager_middles_from_table(paths)
+        try:
+            plans = plan_renames_for_order(paths, middle_parts=mids)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ошибка", str(exc))
+            return
+        n_changes = sum(1 for o, n in plans if o != n)
+        if n_changes == 0:
+            reply = QMessageBox.question(
+                self,
+                "Имена",
+                "Имена уже соответствуют порядку. Обновить только штампы (литера и листы)?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            preview = "\n".join(f"{o.name} → {n.name}" for o, n in plans if o != n)
+            if len(preview) > 3500:
+                preview = preview[:3500] + "\n..."
+            reply = QMessageBox.question(
+                self,
+                "Подтверждение",
+                f"Будет переименовано файлов: {n_changes}\n\n{preview}\n\nПродолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            ok, errs = apply_renames_two_phase(plans)
+            if not ok:
+                QMessageBox.critical(
+                    self,
+                    "Ошибка переименования",
+                    "\n".join(errs) or "Неизвестная ошибка",
+                )
+                return
+        new_paths = [new for _o, new in plans]
+        notes_before: List[str] = []
+        for r in range(self.packager_table.rowCount()):
+            itn = self.packager_table.item(r, 3)
+            notes_before.append(itn.text() if itn else "")
+        self._packager_fill_table(new_paths)
+        for r, note in enumerate(notes_before):
+            if r < self.packager_table.rowCount():
+                self.packager_table.setItem(r, 3, QTableWidgetItem(note))
+        litera = self.packager_litera_edit.text().strip() or None
+        progress = QProgressDialog("Обновление штампов...", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+        root = new_paths[0].parent if new_paths else self._packager_root()
+        if not root:
+            progress.close()
+            return
+        result = update_all_drawing_stamps(
+            self._kompas,
+            root,
+            document_letter=litera,
+            sheet_mode="batch",
+            sheet_batch_paths=new_paths,
+        )
+        progress.close()
+        if result.get("success"):
+            QMessageBox.information(
+                self,
+                "Готово",
+                f"Штампы обновлены: {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Частично",
+                "Переименование выполнено, но при обновлении штампов были ошибки:\n"
+                + "\n".join(str(e) for e in (result.get("errors") or [])[:12]),
+            )
+
+    def _on_packager_stamps_only_clicked(self) -> None:
+        paths = self._packager_paths_from_table()
+        if not paths:
+            QMessageBox.information(self, "Нет данных", "Загрузите чертежи.")
+            return
+        self._on_packager_preview_clicked()
+        litera = self.packager_litera_edit.text().strip() or None
+        progress = QProgressDialog("Обновление штампов по порядку таблицы...", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+        root = paths[0].parent
+        result = update_all_drawing_stamps(
+            self._kompas,
+            root,
+            document_letter=litera,
+            sheet_mode="batch",
+            sheet_batch_paths=paths,
+        )
+        progress.close()
+        if result.get("success"):
+            QMessageBox.information(self, "Готово", "Штампы обновлены по порядку строк таблицы.")
+        else:
+            QMessageBox.critical(
+                self,
+                "Ошибка",
+                "\n".join(str(e) for e in (result.get("errors") or [])),
+            )
+
+    def _on_packager_export_frw_clicked(self) -> None:
+        rows = self._packager_register_rows_for_frw()
+        if not rows:
+            QMessageBox.information(self, "Нет строк", "Загрузите чертежи в таблицу.")
+            return
+        base = self._packager_root() or self._current_project_root or Path.cwd()
+        default = base / "Перечень_чертежей_комплекта.frw"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить перечень как .frw",
+            str(default),
+            "Фрагмент КОМПАС (*.frw);;Все файлы (*.*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".frw"):
+            path = path + ".frw"
+        ok, msg = export_register_frw(
+            rows,
+            Path(path),
+            self._kompas,
+            max_data_rows_per_table=self.packager_frw_rows_spin.value(),
+            data_row_height_mm=float(self.packager_frw_row_h_spin.value()),
+            font_pt=float(self.packager_frw_font_spin.value()),
+        )
+        if ok:
+            QMessageBox.information(self, "FRW", f"Сохранено:\n{msg}")
+        else:
+            QMessageBox.critical(self, "Ошибка FRW", msg)
 
     def _on_generate_qr_clicked(self) -> None:
         """Сгенерировать QR PNG по данным из формы."""
@@ -2683,4 +3619,15 @@ class MainWindow(QMainWindow):
             "Эта версия содержит каркас интерфейса и базовые функции.\n"
             "Детальная логика обновления переменных будет добавлена далее.",
         )
+
+    def closeEvent(self, event) -> None:  # pragma: no cover - GUI
+        """Корректно закрыть сессионный JSON-лог перед выходом."""
+        if self._json_log:
+            try:
+                self._json_log.close()
+            except Exception as exc:
+                logger.warning("Не удалось завершить JSON-лог сессии: %s", exc)
+            finally:
+                self._json_log = None
+        super().closeEvent(event)
 

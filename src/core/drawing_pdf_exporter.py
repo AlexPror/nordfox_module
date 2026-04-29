@@ -10,12 +10,12 @@ from typing import Any
 import requests
 
 try:
-    from pypdf import PdfMerger, PdfReader
+    from pypdf import PdfReader, PdfWriter
 except Exception:  # pragma: no cover
-    PdfMerger = None
     PdfReader = None
+    PdfWriter = None
 
-from .stamp_updater import collect_drawings_for_stamps
+from .stamp_updater import collect_drawings_for_stamps, sort_drawings_for_sheet_numbering
 
 
 logger = logging.getLogger("DrawingPdfExporter")
@@ -92,51 +92,53 @@ class DrawingPdfExporter:
         return {"success": False, "error": str(error)}
 
     def merge_pdf_files(self, pdf_files: list[Path], merged_path: Path) -> dict[str, Any]:
-        local_pdf_merger = PdfMerger
-        local_pdf_reader = PdfReader
-        if local_pdf_merger is None or local_pdf_reader is None:
-            # Lazy import: позволяет подхватить pypdf, установленный уже после старта UI.
+        local_reader = PdfReader
+        local_writer = PdfWriter
+        if local_reader is None or local_writer is None:
             try:
-                from pypdf import PdfMerger as _PdfMerger, PdfReader as _PdfReader
+                from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
 
-                local_pdf_merger = _PdfMerger
-                local_pdf_reader = _PdfReader
+                local_reader = _PdfReader
+                local_writer = _PdfWriter
             except Exception:
                 try:
-                    from PyPDF2 import PdfMerger as _PdfMerger, PdfReader as _PdfReader
+                    from PyPDF2 import PdfReader as _PdfReader, PdfWriter as _PdfWriter
 
-                    local_pdf_merger = _PdfMerger
-                    local_pdf_reader = _PdfReader
+                    local_reader = _PdfReader
+                    local_writer = _PdfWriter
                 except Exception:
                     return {
                         "success": False,
-                        "error": f"pypdf is not installed (python: {sys.executable})",
+                        "error": f"pypdf/PyPDF2 недоступны для слияния (python: {sys.executable})",
                     }
 
         valid = [p for p in pdf_files if p.exists() and p.stat().st_size > 100]
         if not valid:
             return {"success": False, "error": "No valid PDF files to merge"}
 
-        merger = local_pdf_merger()
+        writer = local_writer()
         merged_count = 0
         skipped: list[str] = []
         try:
             for pdf in valid:
                 try:
-                    # Часть PDF из КОМПАС может создаваться с нестандартной структурой.
-                    # Проверяем читаемость и число страниц, иначе пропускаем файл.
                     with pdf.open("rb") as f:
                         header = f.read(4)
                     if header != b"%PDF":
                         skipped.append(f"{pdf.name}: bad header")
                         continue
 
-                    reader = local_pdf_reader(str(pdf))
-                    if len(reader.pages) == 0:
+                    try:
+                        reader = local_reader(str(pdf), strict=False)
+                    except TypeError:
+                        reader = local_reader(str(pdf))
+                    pages = getattr(reader, "pages", None)
+                    if not pages or len(pages) == 0:
                         skipped.append(f"{pdf.name}: no pages")
                         continue
 
-                    merger.append(str(pdf))
+                    for page in reader.pages:
+                        writer.add_page(page)
                     merged_count += 1
                 except Exception as exc:
                     skipped.append(f"{pdf.name}: {exc}")
@@ -149,7 +151,8 @@ class DrawingPdfExporter:
                 }
 
             merged_path.parent.mkdir(parents=True, exist_ok=True)
-            merger.write(str(merged_path))
+            with merged_path.open("wb") as out_fp:
+                writer.write(out_fp)
             return {
                 "success": True,
                 "output_file": str(merged_path),
@@ -158,8 +161,6 @@ class DrawingPdfExporter:
             }
         except Exception as exc:
             return {"success": False, "error": f"PDF merge failed: {exc}"}
-        finally:
-            merger.close()
 
     def export_all_drawings_to_pdf(
         self,
@@ -179,7 +180,7 @@ class DrawingPdfExporter:
         }
 
         root = Path(project_root).resolve()
-        drawings = collect_drawings_for_stamps(root)
+        drawings = sort_drawings_for_sheet_numbering(collect_drawings_for_stamps(root))
         result["total_drawings"] = len(drawings)
         if not drawings:
             result["errors"].append("Чертежи .cdw не найдены")
@@ -224,7 +225,9 @@ class DrawingPdfExporter:
                 for msg in skipped:
                     result["errors"].append(f"Merge skip: {msg}")
             else:
-                result["errors"].append(merge_res.get("error", "PDF merge error"))
+                err_txt = merge_res.get("error", "PDF merge error")
+                result["errors"].append(f"Merge: {err_txt}")
+                logger.warning("PDF merge не выполнен: %s", err_txt)
                 skipped = merge_res.get("skipped") or []
                 for msg in skipped:
                     result["errors"].append(f"Merge skip: {msg}")

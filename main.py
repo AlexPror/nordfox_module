@@ -9,6 +9,7 @@ NordFox Module Manager
 import sys
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
@@ -16,7 +17,9 @@ from PyQt6.QtGui import QFont
 
 def setup_logging() -> None:
     """Базовая настройка логирования для приложения."""
-    os.makedirs("logs", exist_ok=True)
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    logs_dir = os.path.join(project_root, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -24,8 +27,10 @@ def setup_logging() -> None:
         datefmt="%H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(
-                os.path.join("logs", "nordfox_module.log"),
+            RotatingFileHandler(
+                os.path.join(logs_dir, "nordfox_module.log"),
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
                 encoding="utf-8",
             ),
         ],

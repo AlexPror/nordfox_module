@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,6 +48,13 @@ class KompasConnector:
         """Подключение к КОМПАС-3D (инициализация API5 и API7)."""
         try:
             if force_reconnect or not self._connected:
+                if force_reconnect:
+                    # Сброс «битых» ссылок после обрыва RPC / падения процесса КОМПАС
+                    self.application = None
+                    self.api5 = None
+                    self.api7 = None
+                    self._connected = False
+                    time.sleep(1.0)
                 try:
                     pythoncom.CoInitialize()
                 except Exception:
@@ -127,6 +135,11 @@ class KompasConnector:
             if not self.connect():
                 return None
         return self.api5
+
+    def reconnect(self) -> bool:
+        """Переподключение после обрыва COM (например 0x800706BA «Сервер RPC недоступен»)."""
+        self.logger.warning("Переподключение к КОМПАС-3D после потери связи с COM...")
+        return self.connect(force_reconnect=True)
 
     # ------------------------------------------------------------------
     # Работа с документами
