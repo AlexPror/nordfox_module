@@ -16,6 +16,9 @@ from .kompas_connector import KompasConnector
 
 logger = logging.getLogger(__name__)
 
+# Максимум строк данных в одном фрагменте .frw (продолжение — следующий блок).
+_FRW_MAX_DATA_ROWS_PER_TABLE = 38
+
 TITLE = "Перечень чертежей комплекта"
 HEADER = ("Лист", "Наименование", "Примечание")
 
@@ -272,7 +275,7 @@ def export_register_frw(
         return False, "ActiveDocument2D недоступен для фрагмента."
 
     chunks: List[List[Tuple[str, str, str]]] = []
-    n = max(1, int(max_data_rows_per_table))
+    n = max(1, min(_FRW_MAX_DATA_ROWS_PER_TABLE, int(max_data_rows_per_table)))
     for i in range(0, len(data_rows), n):
         chunks.append(data_rows[i : i + n])
 

@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 from . import stamp_cells as SC
 from .kompas_connector import KompasConnector
@@ -323,10 +323,20 @@ def _ensure_sheet_auto_number_disabled(
     if ds is None:
         return False, f"{prefix}{how_err or 'не удалось получить настройки чертежа'}"
 
+    # Если в документе автонумерация уже выключена, повторная запись не нужна и
+    # иногда даёт ложное «после PUT читается вкл» до Save — пропускаем лишний PUT.
+    skip_autonumber_put = False
     try:
-        _set_sheet_auto_number(ds, False)
-    except Exception as exc:
-        return False, f"{prefix}отключение SheetAutoNumber: {exc}"
+        raw0 = _get_sheet_auto_number(ds)
+        skip_autonumber_put = not _sheet_autonumber_enabled(raw0)
+    except Exception:
+        pass
+
+    if not skip_autonumber_put:
+        try:
+            _set_sheet_auto_number(ds, False)
+        except Exception as exc:
+            return False, f"{prefix}отключение SheetAutoNumber: {exc}"
 
     try:
         if predefined_sheets_total is not None:
@@ -355,7 +365,7 @@ def _ensure_sheet_auto_number_disabled(
         if not _sheet_autonumber_enabled(raw_after):
             return True, None
         if attempt == 1:
-            logger.warning(
+            logger.debug(
                 "%sчтение SheetAutoNumber после выключения даёт «вкл» (%r), повторная запись",
                 prefix,
                 raw_after,
@@ -369,7 +379,7 @@ def _ensure_sheet_auto_number_disabled(
             if ds3 is not None:
                 read_ds = ds3
 
-    logger.warning(
+    logger.debug(
         "%sпо чтению API SheetAutoNumber всё ещё «вкл» (%r). "
         "PUT 0 выполнен без ошибки — для КОМПАС чтение иногда не совпадает с фактом до Save; "
         "продолжаем обработку штампа.",
@@ -404,20 +414,25 @@ def _is_rpc_unavailable(exc: BaseException) -> bool:
 def collect_drawings_for_stamps(project_root: Path) -> List[Path]:
     """
     Список чертежей для обработки (без развёрток, без временных ~$).
+
+    Всегда обходим подпапки: если в корне есть .cdw, без этого терялись чертежи
+    только в подкаталогах (например «Чертежи CDW»).
     """
     project_root = Path(project_root).resolve()
-    all_drawings = list(project_root.glob("*.cdw"))
-    if not all_drawings:
-        all_drawings = list(project_root.rglob("*.cdw"))
-        all_drawings = [d for d in all_drawings if not d.name.startswith("~$")]
-
-    out: List[Path] = []
-    for drawing in all_drawings:
+    seen: set[Path] = set()
+    all_drawings: List[Path] = []
+    for drawing in sorted(project_root.rglob("*.cdw"), key=lambda p: str(p).lower()):
+        if drawing.name.startswith("~$"):
+            continue
+        key = drawing.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
         name_lower = drawing.name.lower()
         if "развертка" in name_lower or "razvertka" in name_lower:
             continue
-        out.append(drawing)
-    return out
+        all_drawings.append(drawing)
+    return all_drawings
 
 
 def sort_drawings_for_sheet_numbering(drawings: List[Path]) -> List[Path]:
@@ -637,6 +652,8 @@ def update_all_drawing_stamps(
     sheet_current: int | None = None,
     sheet_total: int | None = None,
     sheet_batch_paths: Sequence[Path] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    ui_pulse: Callable[[], None] | None = None,
 ) -> Dict[str, Any]:
     """
     Обновить штампы всех чертежей в указанной папке проекта.
@@ -648,6 +665,8 @@ def update_all_drawing_stamps(
       - sheet_mode manual: одинаковые sheet_current / sheet_total для всех чертежей;
       - document_letter: литера (ячейка DOCUMENT_LETTER2, см. stamp_cells);
       - developer: 110, checker: 111, …
+      - should_cancel: если True (между файлами) — прервать пакет; внутри одного COM-вызова не действует.
+      - ui_pulse: периодический вызов (например QApplication.processEvents) для отзывчивости UI.
     """
     result: Dict[str, Any] = {
         "success": False,
@@ -656,6 +675,7 @@ def update_all_drawing_stamps(
         "drawings_failed": 0,
         "updated_files": [],
         "errors": [],
+        "cancelled": False,
     }
 
     project_root = Path(project_root).resolve()
@@ -708,8 +728,19 @@ def update_all_drawing_stamps(
     max_retries_per_file = 3
 
     for drawing in all_drawings:
+        if ui_pulse:
+            ui_pulse()
+        if should_cancel and should_cancel():
+            msg = "Остановлено пользователем."
+            logger.warning("%s Уже обновлено чертежей: %s", msg, result["drawings_updated"])
+            result["errors"].append(msg)
+            result["cancelled"] = True
+            break
+
         last_error: str | None = None
         for attempt in range(max_retries_per_file):
+            if ui_pulse:
+                ui_pulse()
             api7 = conn.get_api7()
             if api7 is None:
                 msg = "API7 недоступен для обновления штампов чертежей"
@@ -974,6 +1005,7 @@ def update_all_drawing_stamps(
     logger.info(
         f"ИТОГ ОБНОВЛЕНИЯ ШТАМПОВ: всего={result['drawings_total']}, "
         f"обновлено={result['drawings_updated']}, ошибок={result['drawings_failed']}"
+        f"{', прервано пользователем' if result.get('cancelled') else ''}"
     )
     logger.info("=" * 60)
 

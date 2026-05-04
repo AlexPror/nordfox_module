@@ -97,18 +97,38 @@ def plan_renames_for_order(
 
 
 def apply_renames_two_phase(plans: List[Tuple[Path, Path]]) -> tuple[bool, List[str]]:
-    """Два прохода через уникальные временные имена."""
+    """Два прохода через уникальные временные имена (циклы и перестановки имён поддерживаются)."""
     errors: List[str] = []
     work = [(o, n) for o, n in plans if o != n]
     if not work:
         return True, []
+
+    new_ends = [n.resolve() for _, n in work]
+    if len(new_ends) != len(set(new_ends)):
+        errors.append(
+            "Два чертежа в таблице получают одно целевое имя — проверьте порядок строк и «Наименование»."
+        )
+        return False, errors
+
+    # Текущие пути всех файлов, которые участвуют в переименовании.
+    sources: set = {o.resolve() for o, _ in work}
 
     for old, new in work:
         if not old.exists():
             errors.append(f"Файл не найден: {old}")
             return False, errors
         if new.exists() and new.resolve() != old.resolve():
-            errors.append(f"Целевое имя уже занято: {new.name}")
+            # Частый случай при перестановке порядка: имя «2 …» уже занято другим .cdw из
+            # этой же таблицы — он тоже переименуется; двухфазный проход это обработает.
+            if new.resolve() in sources:
+                continue
+            errors.append(
+                f"Целевое имя уже занято посторонним файлом: {new.name}\n"
+                f"  На диске: {new}\n"
+                f"  Пытались: «{old.name}» → «{new.name}».\n"
+                f"  Если это лишний чертёж не из таблицы — переименуйте или удалите его "
+                f"(файл не должен быть открыт в КОМПАС)."
+            )
             return False, errors
 
     tmp_tag = uuid.uuid4().hex[:10]

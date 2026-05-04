@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QDateTime
+from PyQt6.QtCore import Qt, QDateTime, QTimer
 from PyQt6.QtGui import QAction, QFont, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -143,6 +143,8 @@ class MainWindow(QMainWindow):
         self._assembly_item_new_name: Dict[Path, QLineEdit] = {}
 
         self._kompas = KompasConnector()
+        self._kompas_batch_cancel = False
+        self._packager_register_material_cache: Dict[str, Optional[str]] = {}
         self._json_log: Optional[JsonLogStore] = None
         self._qt_log_handler: Optional[QtTextLogHandler] = None
         self._updating_in_progress: bool = False
@@ -502,16 +504,31 @@ class MainWindow(QMainWindow):
         pack_top.addWidget(self.packager_folder_edit, stretch=1)
         pack_top.addWidget(self.btn_packager_browse)
         pack_layout.addLayout(pack_top)
+        self.packager_auto_on_open_check = QCheckBox(
+            "После выбора папки проекта: загрузить .cdw (с подпапок), порядок по «лист», "
+            "переименовать файлы, обновить номера листов в штампах, сохранить перечень .frw"
+        )
+        self.packager_auto_on_open_check.setToolTip(
+            "Один раз после нажатия «Открыть…» и выбора папки: без лишних диалогов подтверждения. "
+            "Файл перечня: Папка чертежей\\Перечень_чертежей_комплекта.frw. "
+            "Снимите галочку, если нужен только ручной режим. КОМПАС должен быть доступен."
+        )
+        self.packager_auto_on_open_check.setChecked(True)
+        pack_layout.addWidget(self.packager_auto_on_open_check)
 
         self.packager_inner_tabs = QTabWidget()
 
         packager_sub_register = QWidget()
         reg_layout = QVBoxLayout(packager_sub_register)
         fr_opts = QHBoxLayout()
-        fr_opts.addWidget(QLabel("Строк в 1-й табл. FRW:"))
+        fr_opts.addWidget(QLabel("Строк данных в табл. FRW (≤38, из перечня):"))
         self.packager_frw_rows_spin = QSpinBox()
-        self.packager_frw_rows_spin.setRange(5, 200)
+        self.packager_frw_rows_spin.setRange(1, 38)
         self.packager_frw_rows_spin.setValue(28)
+        self.packager_frw_rows_spin.setToolTip(
+            "При обновлении предпросмотра перечня подставляется min(38, число строк). "
+            "Можно уменьшить вручную — тогда будет больше блоков «продолжение» в одном .frw."
+        )
         fr_opts.addWidget(self.packager_frw_rows_spin)
         fr_opts.addWidget(QLabel("Выс. строки, мм:"))
         self.packager_frw_row_h_spin = QDoubleSpinBox()
@@ -529,8 +546,9 @@ class MainWindow(QMainWindow):
         reg_hint = QLabel(
             "Таблица совпадает с будущим видом в .frw (титульный лист не входит). "
             "Загрузите и упорядочьте чертежи на вкладке «Автонумерация файлов». "
-            "Для чертежей узлов в наименование подставляется строка из ячейки материала штампа (номера узлов на листе) — нужен запущенный КОМПАС. "
-            "При необходимости нажмите «Обновить предпросмотр перечня»."
+            "Для чертежей узлов в наименование подставляется строка из ячейки материала штампа — "
+            "при первом обновлении нужен КОМПАС (повторные обновления быстрее за счёт кэша). "
+            "В одном блоке таблицы не больше 38 строк данных; число в поле выше подставляется из перечня."
         )
         reg_hint.setWordWrap(True)
         reg_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
@@ -939,7 +957,33 @@ class MainWindow(QMainWindow):
     def _setup_statusbar(self) -> None:
         status = QStatusBar(self)
         self.setStatusBar(status)
+        self.btn_stop_kompas_batch = QPushButton("Остановить операцию КОМПАС")
+        self.btn_stop_kompas_batch.setToolTip(
+            "Прервать пакетное обновление штампов между чертежами. "
+            "Не прерывает текущий вызов API (открытие/сохранение документа)."
+        )
+        self.btn_stop_kompas_batch.clicked.connect(self._on_stop_kompas_batch_clicked)
+        self.btn_stop_kompas_batch.setEnabled(False)
+        status.addPermanentWidget(self.btn_stop_kompas_batch)
+        self._mark_button(self.btn_stop_kompas_batch, "secondary")
         status.showMessage("Готов к работе. Выберите папку проекта.")
+
+    def _kompas_batch_begin(self) -> None:
+        self._kompas_batch_cancel = False
+        self.btn_stop_kompas_batch.setEnabled(True)
+        QApplication.processEvents()
+
+    def _kompas_batch_end(self) -> None:
+        self._kompas_batch_cancel = False
+        self.btn_stop_kompas_batch.setEnabled(False)
+        QApplication.processEvents()
+
+    def _on_stop_kompas_batch_clicked(self) -> None:
+        self._kompas_batch_cancel = True
+        logger.info(
+            "Запрошена остановка пакета КОМПАС: сработает после текущего шага (между чертежами)."
+        )
+        self.statusBar().showMessage("Остановка: ждём завершения текущего действия КОМПАС…", 8000)
 
     @staticmethod
     def _profile_choices() -> list[str]:
@@ -1180,6 +1224,8 @@ class MainWindow(QMainWindow):
                 "на соответствующих вкладках (при открытии папки они могли подставиться автоматически).\n\n"
                 f"Подробности: {exc}",
             )
+
+        QTimer.singleShot(0, self._packager_try_auto_pipeline_after_project_open)
 
     def _rebuild_variables_form(self) -> None:
         """Перестроить форму переменных на вкладке 'Переменные'."""
@@ -2935,32 +2981,43 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
-        result = update_all_drawing_stamps(
-            self._kompas,
-            self._current_project_root,
-            developer=developer,
-            checker=checker,
-            organization=organization,
-            material=material,
-            tech_control=tech_control,
-            norm_control=norm_control,
-            approved=approved,
-            date=date,
-            role_dates=role_dates or None,
-            designation=designation,
-            name=name,
-            document_letter=document_letter,
-            sheet_mode=sheet_mode,
-            sheet_current=sheet_current,
-            sheet_total=sheet_total,
-        )
+        self._kompas_batch_begin()
+        try:
+            result = update_all_drawing_stamps(
+                self._kompas,
+                self._current_project_root,
+                developer=developer,
+                checker=checker,
+                organization=organization,
+                material=material,
+                tech_control=tech_control,
+                norm_control=norm_control,
+                approved=approved,
+                date=date,
+                role_dates=role_dates or None,
+                designation=designation,
+                name=name,
+                document_letter=document_letter,
+                sheet_mode=sheet_mode,
+                sheet_current=sheet_current,
+                sheet_total=sheet_total,
+                should_cancel=lambda: self._kompas_batch_cancel,
+                ui_pulse=lambda: QApplication.processEvents(),
+            )
+        finally:
+            self._kompas_batch_end()
 
         progress.close()
 
         if self._json_log:
+            status = (
+                "success"
+                if result.get("success")
+                else ("cancelled" if result.get("cancelled") else "partial")
+            )
             self._json_log.add_action(
                 type_="update_stamps",
-                status="success" if result.get("success") else "partial",
+                status=status,
                 input_={
                     "designation": designation,
                     "name": name,
@@ -2981,10 +3038,25 @@ class MainWindow(QMainWindow):
                     "drawings_total": result.get("drawings_total", 0),
                     "drawings_updated": result.get("drawings_updated", 0),
                 },
-                meta={"errors": result.get("errors", [])},
+                meta={
+                    "errors": result.get("errors", []),
+                    "cancelled": bool(result.get("cancelled")),
+                },
             )
 
-        if result.get("success"):
+        if result.get("cancelled"):
+            self.statusBar().showMessage(
+                f"Остановлено: штампы {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}",
+                8000,
+            )
+            QMessageBox.warning(
+                self,
+                "Остановлено",
+                f"Обработка прервана по запросу.\n"
+                f"Штампов обновлено: {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}.\n\n"
+                "Во время одного действия КОМПАС (открытие или сохранение файла) остановка срабатывает только после его завершения.",
+            )
+        elif result.get("success"):
             self.statusBar().showMessage(
                 f"Штампы обновлены: чертежей={result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}",
                 5000,
@@ -3203,15 +3275,29 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         litera = self.stamp_litera_edit.text().strip() or None
-        result = update_all_drawing_stamps(
-            self._kompas,
-            root,
-            document_letter=litera,
-            sheet_mode="batch",
-        )
+        self._kompas_batch_begin()
+        try:
+            result = update_all_drawing_stamps(
+                self._kompas,
+                root,
+                document_letter=litera,
+                sheet_mode="batch",
+                should_cancel=lambda: self._kompas_batch_cancel,
+                ui_pulse=lambda: QApplication.processEvents(),
+            )
+        finally:
+            self._kompas_batch_end()
         progress.close()
 
-        if result.get("success"):
+        if result.get("cancelled"):
+            QMessageBox.warning(
+                self,
+                "Остановлено",
+                f"Автонумерация прервана.\n"
+                f"Обновлено: {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}.\n\n"
+                "Во время одного действия КОМПАС остановка срабатывает только после его завершения.",
+            )
+        elif result.get("success"):
             QMessageBox.information(
                 self,
                 "Готово",
@@ -3252,6 +3338,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _packager_fill_table(self, paths: List[Path]) -> None:
+        self._packager_register_material_cache.clear()
         self.packager_table.blockSignals(True)
         try:
             self.packager_table.setRowCount(0)
@@ -3277,7 +3364,10 @@ class MainWindow(QMainWindow):
         """Строки перечня как в .frw: титул не входит; «Лист» — 1…N по порядку в таблице."""
         rows: List[tuple[str, str, str]] = []
         seq = 0
+        cache = self._packager_register_material_cache
         for r in range(self.packager_table.rowCount()):
+            if r % 4 == 0:
+                QApplication.processEvents()
             p = self._packager_path_from_row(r)
             if not p or is_drawing_title_sheet(p):
                 continue
@@ -3287,7 +3377,10 @@ class MainWindow(QMainWindow):
             raw_name = itn.text().strip() if itn else ""
             name = format_register_name_from_middle(raw_name)
             if is_drawing_node_sheet(p):
-                mat_line = read_stamp_cell_str(self._kompas, p, STAMP_CELLS.MATERIAL)
+                key = str(p.resolve())
+                if key not in cache:
+                    cache[key] = read_stamp_cell_str(self._kompas, p, STAMP_CELLS.MATERIAL)
+                mat_line = cache[key]
                 if mat_line:
                     name = append_material_to_register_line(name, mat_line)
             note = itp.text().strip() if itp else ""
@@ -3296,6 +3389,10 @@ class MainWindow(QMainWindow):
 
     def _packager_refresh_register_preview(self) -> None:
         rows = self._packager_register_rows_for_frw()
+        if rows:
+            self.packager_frw_rows_spin.blockSignals(True)
+            self.packager_frw_rows_spin.setValue(min(38, len(rows)))
+            self.packager_frw_rows_spin.blockSignals(False)
         t = self.packager_register_table
         t.setRowCount(len(rows))
         for i, (sheet, name, note) in enumerate(rows):
@@ -3330,6 +3427,22 @@ class MainWindow(QMainWindow):
         self.packager_table.removeRow(r)
         self._on_packager_preview_clicked()
 
+    def _packager_paths_and_middles(self) -> tuple[List[Path], List[str]]:
+        """Строки таблицы с файлом: пути и средние части имён в одном порядке."""
+        paths: List[Path] = []
+        mids: List[str] = []
+        for r in range(self.packager_table.rowCount()):
+            p = self._packager_path_from_row(r)
+            if not p:
+                continue
+            _l, mid, _s = parse_cdw_stem(p.stem)
+            it = self.packager_table.item(r, 1)
+            if it and it.text().strip():
+                mid = it.text().strip()
+            paths.append(p)
+            mids.append(mid)
+        return paths, mids
+
     def _packager_paths_from_table(self) -> List[Path]:
         out: List[Path] = []
         for r in range(self.packager_table.rowCount()):
@@ -3338,15 +3451,100 @@ class MainWindow(QMainWindow):
                 out.append(p)
         return out
 
-    def _packager_middles_from_table(self, paths: List[Path]) -> List[str]:
-        mids: List[str] = []
-        for r, p in enumerate(paths):
-            _l, mid, _s = parse_cdw_stem(p.stem)
-            it = self.packager_table.item(r, 1)
-            if it and it.text().strip():
-                mid = it.text().strip()
-            mids.append(mid)
-        return mids
+    def _packager_try_auto_pipeline_after_project_open(self) -> None:
+        if not self.packager_auto_on_open_check.isChecked():
+            return
+        root = self._packager_root()
+        if not root or not root.is_dir():
+            logger.info("Автокомплект: папка чертежей не задана или не существует")
+            return
+        drawings = sort_drawings_for_sheet_numbering(collect_drawings_for_stamps(root))
+        if not drawings:
+            logger.info("Автокомплект: в %s нет подходящих .cdw", root)
+            self.statusBar().showMessage(f"Автокомплект: в папке нет .cdw — {root}", 8000)
+            return
+        self._packager_fill_table(drawings)
+        paths, mids = self._packager_paths_and_middles()
+        if not paths:
+            return
+        try:
+            plans = plan_renames_for_order(paths, middle_parts=mids)
+        except ValueError as exc:
+            logger.error("Автокомплект: план переименования — %s", exc)
+            QMessageBox.warning(self, "Автокомплект чертежей", str(exc))
+            return
+        n_changes = sum(1 for o, n in plans if o != n)
+        if n_changes > 0:
+            ok, errs = apply_renames_two_phase(plans)
+            if not ok:
+                logger.error("Автокомплект: переименование — %s", errs)
+                QMessageBox.warning(
+                    self,
+                    "Переименование чертежей",
+                    "Не удалось переименовать файлы (закройте чертежи в КОМПАС и повторите):\n"
+                    + "\n".join(errs),
+                )
+                return
+        new_paths = [new for _o, new in plans]
+        notes_before: List[str] = []
+        for r in range(self.packager_table.rowCount()):
+            itn = self.packager_table.item(r, 3)
+            notes_before.append(itn.text() if itn else "")
+        self._packager_fill_table(new_paths)
+        for r, note in enumerate(notes_before):
+            if r < self.packager_table.rowCount():
+                self.packager_table.setItem(r, 3, QTableWidgetItem(note))
+        litera = self.packager_litera_edit.text().strip() or None
+        stamp_root = new_paths[0].parent if new_paths else root
+        self._kompas_batch_begin()
+        try:
+            result = update_all_drawing_stamps(
+                self._kompas,
+                stamp_root,
+                document_letter=litera,
+                sheet_mode="batch",
+                sheet_batch_paths=new_paths,
+                should_cancel=lambda: self._kompas_batch_cancel,
+                ui_pulse=lambda: QApplication.processEvents(),
+            )
+        finally:
+            self._kompas_batch_end()
+        if result.get("cancelled"):
+            QMessageBox.warning(self, "Автокомплект", "Обновление штампов остановлено.")
+            return
+        if not result.get("success"):
+            QMessageBox.warning(
+                self,
+                "Автокомплект — штампы",
+                "Ошибки при обновлении штампов:\n"
+                + "\n".join(str(e) for e in (result.get("errors") or [])[:18]),
+            )
+        rows = self._packager_register_rows_for_frw()
+        if not rows:
+            self.statusBar().showMessage("Автокомплект: перечень пуст.", 8000)
+            return
+        frw_path = stamp_root / "Перечень_чертежей_комплекта.frw"
+        ok_frw, msg_frw = export_register_frw(
+            rows,
+            frw_path,
+            self._kompas,
+            max_data_rows_per_table=self.packager_frw_rows_spin.value(),
+            data_row_height_mm=float(self.packager_frw_row_h_spin.value()),
+            font_pt=float(self.packager_frw_font_spin.value()),
+        )
+        if not ok_frw:
+            QMessageBox.warning(self, "Автокомплект — FRW", msg_frw)
+            return
+        logger.info("Автокомплект: перечень сохранён — %s", msg_frw)
+        self.statusBar().showMessage(f"Автокомплект готов: {frw_path.name} ({len(new_paths)} черт.)", 12000)
+        if result.get("success"):
+            QMessageBox.information(
+                self,
+                "Автокомплект",
+                f"Чертежей: {len(new_paths)}\n"
+                f"Штампы: обновлено {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}.\n"
+                f"Перечень: {frw_path}",
+            )
 
     def _on_packager_load_clicked(self) -> None:
         root = self._packager_root()
@@ -3427,12 +3625,11 @@ class MainWindow(QMainWindow):
         self.packager_table.setCurrentCell(r + 1, 0)
 
     def _on_packager_rename_and_stamps_clicked(self) -> None:
-        paths = self._packager_paths_from_table()
+        self._on_packager_preview_clicked()
+        paths, mids = self._packager_paths_and_middles()
         if not paths:
             QMessageBox.information(self, "Нет данных", "Загрузите чертежи или проверьте таблицу.")
             return
-        self._on_packager_preview_clicked()
-        mids = self._packager_middles_from_table(paths)
         try:
             plans = plan_renames_for_order(paths, middle_parts=mids)
         except ValueError as exc:
@@ -3489,15 +3686,30 @@ class MainWindow(QMainWindow):
         if not root:
             progress.close()
             return
-        result = update_all_drawing_stamps(
-            self._kompas,
-            root,
-            document_letter=litera,
-            sheet_mode="batch",
-            sheet_batch_paths=new_paths,
-        )
+        self._kompas_batch_begin()
+        try:
+            result = update_all_drawing_stamps(
+                self._kompas,
+                root,
+                document_letter=litera,
+                sheet_mode="batch",
+                sheet_batch_paths=new_paths,
+                should_cancel=lambda: self._kompas_batch_cancel,
+                ui_pulse=lambda: QApplication.processEvents(),
+            )
+        finally:
+            self._kompas_batch_end()
         progress.close()
-        if result.get("success"):
+        if result.get("cancelled"):
+            QMessageBox.warning(
+                self,
+                "Остановлено",
+                f"Обновление штампов прервано.\n"
+                f"Обновлено: {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}.\n"
+                "Переименование (если было) уже выполнено.\n\n"
+                "Во время одного действия КОМПАС остановка срабатывает только после его завершения.",
+            )
+        elif result.get("success"):
             QMessageBox.information(
                 self,
                 "Готово",
@@ -3524,15 +3736,29 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
         root = paths[0].parent
-        result = update_all_drawing_stamps(
-            self._kompas,
-            root,
-            document_letter=litera,
-            sheet_mode="batch",
-            sheet_batch_paths=paths,
-        )
+        self._kompas_batch_begin()
+        try:
+            result = update_all_drawing_stamps(
+                self._kompas,
+                root,
+                document_letter=litera,
+                sheet_mode="batch",
+                sheet_batch_paths=paths,
+                should_cancel=lambda: self._kompas_batch_cancel,
+                ui_pulse=lambda: QApplication.processEvents(),
+            )
+        finally:
+            self._kompas_batch_end()
         progress.close()
-        if result.get("success"):
+        if result.get("cancelled"):
+            QMessageBox.warning(
+                self,
+                "Остановлено",
+                f"Обработка прервана.\n"
+                f"Обновлено: {result.get('drawings_updated', 0)} из {result.get('drawings_total', 0)}.\n\n"
+                "Во время одного действия КОМПАС остановка срабатывает только после его завершения.",
+            )
+        elif result.get("success"):
             QMessageBox.information(self, "Готово", "Штампы обновлены по порядку строк таблицы.")
         else:
             QMessageBox.critical(
